@@ -24,6 +24,8 @@ const state = {
   stateSyncInFlight: false,
   lastPlayerCount: 0,
   hostCheckpointTimer: null,
+  hostCheckpointPending: null,
+  hostStateRetryCount: 0,
   lastResyncRequestAt: 0,
 };
 
@@ -275,6 +277,10 @@ async function connectRoom() {
     setConnection("live", "ROOM RECONNECTED");
     state.self = null;
     state.players = [];
+    state.seq = 0;
+    state.lastAck = null;
+    state.lastSentInput = "";
+    state.lastLoggedInput = "";
     if (state.lobby && state.romMeta?.valid) {
       state.room.send({ type: "join_lobby", lobbyId: state.lobby.id, romKey: state.romMeta.romKey, romValid: true, patchProfile: state.romMeta.patchProfile });
       log("join_lobby_replay", { lobbyId: state.lobby.id, romKey: state.romMeta.romKey, patchProfile: state.romMeta.patchProfile });
@@ -307,6 +313,10 @@ function handleRoomMessage(raw) {
     state.lobby = message.lobby;
     state.self = message.self;
     state.players = mergePlayers([], message.players);
+    state.seq = 0;
+    state.lastAck = null;
+    state.lastSentInput = "";
+    state.lastLoggedInput = "";
     $("partyStatus").classList.remove("hidden");
     $("activeLobbyCode").textContent = state.lobby.id;
     $("partyStatusLabel").textContent = `${state.lobby.visibility.toUpperCase()} LOBBY · P${state.self.slot}`;
@@ -508,46 +518,54 @@ async function decompressState(bytes, encoding) {
   return new Uint8Array(await new Response(stream).arrayBuffer());
 }
 
-function scheduleHostCheckpoint(reason) {
+function scheduleHostCheckpoint(reason, delayMs = 600) {
   if (state.hostCheckpointTimer) window.clearTimeout(state.hostCheckpointTimer);
-  state.hostCheckpointTimer = window.setTimeout(() => sendHostCheckpoint(reason), 600);
+  state.hostCheckpointTimer = window.setTimeout(() => sendHostCheckpoint(reason), delayMs);
 }
 
 async function sendHostCheckpoint(reason = "periodic") {
-  if (state.stateSyncInFlight || !state.self || state.self.slot !== 1 || !state.lobby || !state.emulatorReady || state.players.length < 2) return;
+  if (state.stateSyncInFlight) { state.hostCheckpointPending = reason; return; }
+  if (!state.self || state.self.slot !== 1 || !state.lobby || !state.emulatorReady || state.players.length < 2) return;
   const gameManager = window.EJS_emulator?.gameManager;
   if (typeof gameManager?.getState !== "function") { log("host_state_unavailable", { reason, getState: false }, "WARN"); return; }
   state.stateSyncInFlight = true;
-  let paused = false;
   try {
-    if (typeof window.EJS_emulator.pause === "function") { window.EJS_emulator.pause(); paused = true; }
-    await new Promise((resolve) => window.setTimeout(resolve, 60));
     const rawState = gameManager.getState();
     const bytes = new Uint8Array(rawState instanceof Uint8Array ? rawState : new Uint8Array(rawState));
     if (!bytes.byteLength) throw new Error("Emulator returned an empty savestate");
     if (paused && typeof window.EJS_emulator.play === "function") { window.EJS_emulator.play(); paused = false; }
     const packed = await compressState(bytes);
     if (packed.bytes.byteLength > 20 * 1024 * 1024) throw new Error(`Compressed savestate is ${packed.bytes.byteLength} bytes; room limit is 20 MB`);
-    const chunkSize = 24000;
+    const chunkSize = 28000;
     const totalChunks = Math.ceil(packed.bytes.byteLength / chunkSize);
     if (totalChunks > 900) throw new Error(`Compressed savestate needs ${totalChunks} chunks; room limit is 900`);
     const syncId = `${Date.now()}-${Math.random().toString(16).slice(2)}`;
     state.room.send({ type: "host_state_begin", syncId, totalBytes: packed.bytes.byteLength, rawBytes: bytes.byteLength, totalChunks, encoding: packed.encoding, chunkEncoding: "hex", stateTick: state.lastServerTick || 0 });
     for (let index = 0; index < totalChunks; index += 1) {
       state.room.send({ type: "host_state_chunk", syncId, index, data: hexFromBytes(packed.bytes.subarray(index * chunkSize, Math.min(packed.bytes.byteLength, (index + 1) * chunkSize))) });
-      await new Promise((resolve) => window.setTimeout(resolve, 10));
+      await new Promise((resolve) => window.setTimeout(resolve, 1));
     }
     state.room.send({ type: "host_state_end", syncId, stateTick: state.lastServerTick || 0 });
+    state.hostStateRetryCount = 0;
     log("host_state_sent", { reason, syncId, bytes: packed.bytes.byteLength, rawBytes: bytes.byteLength, compression: `${Math.round((packed.bytes.byteLength / bytes.byteLength) * 100)}%`, encoding: packed.encoding, chunkEncoding: "hex", totalChunks });
   } catch (error) {
     const message = error?.message || String(error);
     log("host_state_error", { reason, message }, "ERROR");
-    if (reason === "capabilities_ready" && /null function/i.test(message)) {
-      log("host_state_retry_scheduled", { reason: "capabilities_retry", delayMs: 600 }, "WARN");
-      scheduleHostCheckpoint("capabilities_retry");
+    if (/null function/i.test(message) && state.hostStateRetryCount < 4) {
+      state.hostStateRetryCount += 1;
+      const delayMs = Math.min(5000, 600 * (2 ** (state.hostStateRetryCount - 1)));
+      log("host_state_retry_scheduled", { reason: "capabilities_retry", attempt: state.hostStateRetryCount, delayMs }, "WARN");
+      scheduleHostCheckpoint("capabilities_retry", delayMs);
     }
   }
-  finally { state.stateSyncInFlight = false; if (paused && typeof window.EJS_emulator.play === "function") window.EJS_emulator.play(); }
+  finally {
+    state.stateSyncInFlight = false;
+    if (state.hostCheckpointPending) {
+      const pendingReason = state.hostCheckpointPending;
+      state.hostCheckpointPending = null;
+      scheduleHostCheckpoint(pendingReason);
+    }
+  }
 }
 
 async function applyPendingHostState() {
@@ -600,7 +618,7 @@ function setupKeyboard() {
   window.addEventListener("keyup", (event) => { const key = keys[event.key.toLowerCase()]; if (!key) return; event.preventDefault(); setKey(key, false); });
   window.addEventListener("blur", releaseKeys);
   document.addEventListener("visibilitychange", () => { if (document.hidden) releaseKeys(); });
-  window.setInterval(() => { if (state.self) sendInput(true); }, 100);
+  window.setInterval(() => { if (state.self) sendInput(true); }, 16);
 }
 
 async function launchEmulator(reason = "manual") {
@@ -673,7 +691,7 @@ function bindUI() {
 }
 
 async function boot() {
-  bindUI(); setupKeyboard(); window.setInterval(tickClock, 1000); window.setInterval(() => { if (state.self?.slot === 1 && state.players.length > 1) scheduleHostCheckpoint("periodic"); }, 10000); refreshLobbies();
+  bindUI(); setupKeyboard(); window.setInterval(tickClock, 1000); window.setInterval(() => { if (state.self?.slot === 1 && state.players.length > 1) scheduleHostCheckpoint("periodic"); }, 30000); refreshLobbies();
   try { state.user = await window.websim?.getUser?.(); log("identity_loaded", { signedIn: Boolean(state.user), username: state.user?.username || null }); }
   catch (error) { log("identity_error", { message: error.message }, "WARN"); }
   log("client_ready", { browser: navigator.userAgent, protocol: "input-authority/0.1" });
