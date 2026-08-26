@@ -78,11 +78,28 @@ async function broadcastLobby(lobby, room) {
 async function sendStateSyncToMember(lobby, member) {
   const sync = lobby.stateSync;
   if (!sync) return;
-  member.conn.send({ type: "host_state_begin", lobbyId: lobby.id, syncId: sync.syncId, totalBytes: sync.totalBytes, rawBytes: sync.rawBytes, totalChunks: sync.totalChunks, encoding: sync.encoding, chunkEncoding: sync.chunkEncoding || "base64url", stateTick: sync.stateTick, romKey: sync.romKey, patchProfile: sync.patchProfile });
+  member.conn.send({ type: "host_state_begin", lobbyId: lobby.id, syncId: sync.syncId, totalBytes: sync.totalBytes, rawBytes: sync.rawBytes, totalChunks: sync.totalChunks, encoding: sync.encoding, chunkEncoding: sync.chunkEncoding || "base64url", stateTick: sync.stateTick, stateVersion: sync.stateVersion || lobby.stateVersion, barrierId: sync.barrierId || lobby.syncBarrierId || null, romKey: sync.romKey, patchProfile: sync.patchProfile });
   for (let index = 0; index < sync.chunks.length; index += 1) {
     if (sync.chunks[index]) member.conn.send({ type: "host_state_chunk", lobbyId: lobby.id, syncId: sync.syncId, index, data: sync.chunks[index] });
   }
-  if (sync.received === sync.totalChunks) member.conn.send({ type: "host_state_end", lobbyId: lobby.id, syncId: sync.syncId, stateVersion: lobby.stateVersion, stateTick: sync.stateTick, rawBytes: sync.rawBytes, encoding: sync.encoding, serverTime: Date.now() });
+  if (sync.received === sync.totalChunks) member.conn.send({ type: "host_state_end", lobbyId: lobby.id, syncId: sync.syncId, stateVersion: sync.stateVersion || lobby.stateVersion, barrierId: sync.barrierId || lobby.syncBarrierId || null, stateTick: sync.stateTick, rawBytes: sync.rawBytes, encoding: sync.encoding, chunkEncoding: sync.chunkEncoding || "base64url", serverTime: Date.now() });
+}
+
+function startPeerSyncBarrier(lobby) {
+  const targetVersion = lobby.syncTargetVersion || (lobby.stateVersion + 1);
+  lobby.syncTargetVersion = targetVersion;
+  lobby.syncBarrierId = lobby.syncBarrierId || `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+  for (const member of lobby.members.values()) {
+    if (member.slot !== 1) member.syncedStateVersion = Math.min(member.syncedStateVersion || 0, targetVersion - 1);
+  }
+  return { barrierId: lobby.syncBarrierId, targetVersion };
+}
+
+function peerSyncStatus(lobby) {
+  const peers = [...lobby.members.values()].filter((member) => member.slot !== 1);
+  const targetVersion = lobby.syncTargetVersion || lobby.stateVersion;
+  const readyCount = peers.filter((member) => member.syncedStateVersion >= targetVersion).length;
+  return { targetVersion, readyCount, peerCount: peers.length, allReady: peers.length > 0 && readyCount === peers.length };
 }
 
 function sanitizeInput(raw, lastSeq) {
@@ -156,7 +173,7 @@ export default {
 };
 
 export const room = {
-  tickMs: 50,
+  tickMs: 16,
 
   async onConnect(conn) {
     if (conn.identity !== "user") {
@@ -179,7 +196,7 @@ export const room = {
       const runtime = await env.DB.prepare("SELECT rom_key, patch_profile, host_ready, state_version FROM lobby_runtime WHERE lobby_id = ?").bind(lobbyId).first();
       let lobby = activeLobbies.get(lobbyId);
       if (!lobby) {
-        lobby = { id: lobbyId, visibility: row.visibility, username: row.username, members: new Map(), createdAt: Date.now(), tick: 0, stateVersion: Number(runtime?.state_version || 0), hostConnectionId: null, stateSync: null, hostReady: runtime?.host_ready === 1, romKey: runtime?.rom_key || null, patchProfile: runtime?.patch_profile || null };
+        lobby = { id: lobbyId, visibility: row.visibility, username: row.username, members: new Map(), createdAt: Date.now(), tick: 0, stateVersion: Number(runtime?.state_version || 0), syncBarrierId: null, syncTargetVersion: 0, hostConnectionId: null, stateSync: null, hostReady: runtime?.host_ready === 1, romKey: runtime?.rom_key || null, patchProfile: runtime?.patch_profile || null };
         activeLobbies.set(lobbyId, lobby);
       } else if (runtime) {
         lobby.hostReady = runtime.host_ready === 1;
@@ -196,13 +213,17 @@ export const room = {
       if (input.romValid !== true || !/^[a-f0-9]{64}$/.test(romKey)) { conn.send({ type: "join_rejected", code: "ROM_REQUIRED", message: "Load and validate the Gauntlet Legends ROM before joining." }); return; }
       if (lobby.romKey && lobby.romKey !== romKey) { conn.send({ type: "join_rejected", code: "ROM_MISMATCH", message: "Your ROM fingerprint does not match the host's ROM." }); return; }
       if (!lobby.romKey) { lobby.romKey = romKey; lobby.patchProfile = patchProfile || "gl-n64-websim-bridge-0.1"; }
-      const member = { conn, userId: conn.userId, username: conn.username || "player", slot, lastSeq: -1, latestInput: null, joinedAt: Date.now(), romKey, patchProfile };
+      const member = { conn, userId: conn.userId, username: conn.username || "player", slot, lastSeq: -1, latestInput: null, syncedStateVersion: 0, joinedAt: Date.now(), romKey, patchProfile };
       lobby.members.set(conn.id, member);
       connectionLobbies.set(conn.id, lobbyId);
       if (!lobby.hostConnectionId || slot === 1) lobby.hostConnectionId = slot === 1 ? conn.id : lobby.hostConnectionId;
       await env.DB.prepare("UPDATE lobbies SET last_seen_at = ? WHERE id = ?").bind(Date.now(), lobbyId).run();
       conn.send({ type: "joined_lobby", lobby: lobbySummary(lobby), self: memberSummary(member), players: publicPlayers(lobby), serverTime: Date.now() });
       await broadcastLobby(lobby, room);
+      if (slot !== 1 && lobby.hostConnectionId) {
+        const barrier = startPeerSyncBarrier(lobby);
+        room.broadcast({ type: "peer_sync_required", lobbyId: lobby.id, memberId: conn.id, barrierId: barrier.barrierId, targetVersion: barrier.targetVersion, serverTime: Date.now() });
+      }
       if (lobby.stateSync) await sendStateSyncToMember(lobby, member);
       console.log(JSON.stringify({ event: "lobby_joined", lobbyId, connectionId: conn.id, slot, playerCount: lobby.members.size }));
       return;
@@ -219,13 +240,30 @@ export const room = {
       me.lastSeq = sanitized.seq;
       me.latestInput = sanitized;
       conn.send({ type: "input_ack", seq: me.lastSeq, serverTime: Date.now() });
-      room.broadcast({ type: "input_relay", lobbyId: lobby.id, player: { id: conn.id, username: me.username, slot: me.slot, seq: me.lastSeq, input: { seq: sanitized.seq, buttons: sanitized.buttons, axisX: sanitized.axisX, axisY: sanitized.axisY } } });
+      room.broadcast({ type: "input_relay", lobbyId: lobby.id, serverTick: lobby.tick, player: { id: conn.id, username: me.username, slot: me.slot, seq: me.lastSeq, input: { seq: sanitized.seq, buttons: sanitized.buttons, axisX: sanitized.axisX, axisY: sanitized.axisY } } }, { except: [conn.id] });
       return;
     }
 
     if (input.type === "request_host_state") {
       if (me.slot !== 1) await sendStateSyncToMember(lobby, me);
       console.log(JSON.stringify({ event: "host_state_resend", lobbyId: lobby.id, memberId: conn.id, syncId: lobby.stateSync?.syncId || null }));
+      return;
+    }
+
+    if (input.type === "host_state_applied") {
+      if (me.slot === 1) return;
+      const stateVersion = Number(input.stateVersion);
+      if (!Number.isSafeInteger(stateVersion) || stateVersion < 1 || stateVersion > lobby.stateVersion) return;
+      if (lobby.syncTargetVersion && stateVersion < lobby.syncTargetVersion) return;
+      if (lobby.syncBarrierId && String(input.barrierId || "") !== lobby.syncBarrierId) return;
+      me.syncedStateVersion = Math.max(me.syncedStateVersion || 0, stateVersion);
+      const status = peerSyncStatus(lobby);
+      room.broadcast({ type: "peer_sync_status", lobbyId: lobby.id, memberId: conn.id, barrierId: lobby.syncBarrierId || null, stateVersion, ...status });
+      console.log(JSON.stringify({ event: "peer_sync_ready", lobbyId: lobby.id, memberId: conn.id, stateVersion, barrierId: lobby.syncBarrierId || null, ...status }));
+      if (status.allReady && lobby.syncTargetVersion) {
+        lobby.syncTargetVersion = 0;
+        lobby.syncBarrierId = null;
+      }
       return;
     }
 
@@ -251,8 +289,8 @@ export const room = {
         const encoding = input.encoding === "gzip" ? "gzip" : input.encoding === "identity" ? "identity" : "";
         const chunkEncoding = input.chunkEncoding === "hex" ? "hex" : "base64url";
         if (!syncId || !Number.isSafeInteger(totalBytes) || totalBytes < 1 || totalBytes > 20 * 1024 * 1024 || !Number.isSafeInteger(rawBytes) || rawBytes < 1 || rawBytes > 32 * 1024 * 1024 || !Number.isSafeInteger(totalChunks) || totalChunks < 1 || totalChunks > 900 || !encoding) { conn.send({ type: "state_sync_rejected", code: "BAD_STATE_HEADER" }); return; }
-        lobby.stateSync = { syncId, totalBytes, rawBytes, totalChunks, encoding, chunkEncoding, chunks: new Array(totalChunks), received: 0, stateTick: Number(input.stateTick) || 0, romKey: lobby.romKey, patchProfile: lobby.patchProfile };
-        room.broadcast({ type: "host_state_begin", lobbyId: lobby.id, syncId, totalBytes, rawBytes, totalChunks, encoding, chunkEncoding, stateTick: lobby.stateSync.stateTick, romKey: lobby.romKey, patchProfile: lobby.patchProfile }, { except: [conn.id] });
+        lobby.stateSync = { syncId, totalBytes, rawBytes, totalChunks, encoding, chunkEncoding, chunks: new Array(totalChunks), received: 0, stateTick: Number(input.stateTick) || 0, stateVersion: lobby.stateVersion + 1, barrierId: lobby.syncBarrierId || null, romKey: lobby.romKey, patchProfile: lobby.patchProfile };
+        room.broadcast({ type: "host_state_begin", lobbyId: lobby.id, syncId, totalBytes, rawBytes, totalChunks, encoding, chunkEncoding, stateTick: lobby.stateSync.stateTick, stateVersion: lobby.stateSync.stateVersion, barrierId: lobby.stateSync.barrierId, romKey: lobby.romKey, patchProfile: lobby.patchProfile }, { except: [conn.id] });
         return;
       }
       if (!lobby.stateSync || String(input.syncId) !== lobby.stateSync.syncId) { conn.send({ type: "state_sync_rejected", code: "UNKNOWN_STATE_SYNC" }); return; }
@@ -265,9 +303,10 @@ export const room = {
         return;
       }
       if (lobby.stateSync.received !== lobby.stateSync.totalChunks) { conn.send({ type: "state_sync_rejected", code: "STATE_INCOMPLETE", received: lobby.stateSync.received, expected: lobby.stateSync.totalChunks }); return; }
-      lobby.stateVersion += 1;
+      lobby.stateVersion = lobby.stateSync.stateVersion || (lobby.stateVersion + 1);
+      for (const member of lobby.members.values()) if (member.slot !== 1) member.syncedStateVersion = Math.min(member.syncedStateVersion || 0, lobby.stateVersion - 1);
       await env.DB.prepare("UPDATE lobby_runtime SET state_version = ?, updated_at = ? WHERE lobby_id = ?").bind(lobby.stateVersion, Date.now(), lobby.id).run();
-      room.broadcast({ type: "host_state_end", lobbyId: lobby.id, syncId: lobby.stateSync.syncId, stateVersion: lobby.stateVersion, stateTick: lobby.stateSync.stateTick, rawBytes: lobby.stateSync.rawBytes, encoding: lobby.stateSync.encoding, chunkEncoding: lobby.stateSync.chunkEncoding, serverTime: Date.now() }, { except: [conn.id] });
+      room.broadcast({ type: "host_state_end", lobbyId: lobby.id, syncId: lobby.stateSync.syncId, stateVersion: lobby.stateVersion, barrierId: lobby.stateSync.barrierId, stateTick: lobby.stateSync.stateTick, rawBytes: lobby.stateSync.rawBytes, encoding: lobby.stateSync.encoding, chunkEncoding: lobby.stateSync.chunkEncoding, serverTime: Date.now() }, { except: [conn.id] });
       conn.send({ type: "host_state_committed", lobbyId: lobby.id, syncId: lobby.stateSync.syncId, stateVersion: lobby.stateVersion, bytes: lobby.stateSync.totalBytes, rawBytes: lobby.stateSync.rawBytes, encoding: lobby.stateSync.encoding });
       console.log(JSON.stringify({ event: "host_state_committed", lobbyId: lobby.id, stateVersion: lobby.stateVersion, bytes: lobby.stateSync.totalBytes, rawBytes: lobby.stateSync.rawBytes, encoding: lobby.stateSync.encoding }));
       return;
@@ -313,6 +352,10 @@ export const room = {
       return;
     }
     await broadcastLobby(lobby, room);
+    if (lobby.syncTargetVersion) {
+      const status = peerSyncStatus(lobby);
+      room.broadcast({ type: "peer_sync_status", lobbyId: lobby.id, barrierId: lobby.syncBarrierId || null, stateVersion: lobby.stateVersion, ...status });
+    }
     console.log(JSON.stringify({ event: "room_disconnected", lobbyId: lobby.id, connectionId: conn.id, playerCount: lobby.members.size }));
   },
 };
