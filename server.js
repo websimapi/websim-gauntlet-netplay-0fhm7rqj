@@ -97,8 +97,9 @@ function sanitizeStreamSignal(value) {
   if (value.kind === "candidate") {
     const candidate = String(value.candidate?.candidate || "");
     const sdpMid = value.candidate?.sdpMid == null ? null : String(value.candidate.sdpMid).slice(0, 80);
-    const sdpMLineIndex = Number(value.candidate?.sdpMLineIndex);
-    if (!candidate || candidate.length > 4000 || !Number.isSafeInteger(sdpMLineIndex) || sdpMLineIndex < 0 || sdpMLineIndex > 64) return null;
+    const rawMLineIndex = value.candidate?.sdpMLineIndex;
+    const sdpMLineIndex = rawMLineIndex == null || rawMLineIndex === "" ? null : Number(rawMLineIndex);
+    if (!candidate || candidate.length > 4000 || (!sdpMid && sdpMLineIndex == null) || (sdpMLineIndex != null && (!Number.isSafeInteger(sdpMLineIndex) || sdpMLineIndex < 0 || sdpMLineIndex > 64))) return null;
     return { kind: "candidate", candidate: { candidate, sdpMid, sdpMLineIndex, usernameFragment: String(value.candidate?.usernameFragment || "").slice(0, 256) } };
   }
   return null;
@@ -236,6 +237,18 @@ export const room = {
         return;
       }
       target.conn.send({ type: "stream_signal", lobbyId: lobby.id, fromId: conn.id, signal });
+      console.log(JSON.stringify({ event: "stream_signal_relay", lobbyId: lobby.id, fromId: conn.id, toId: target.conn.id, kind: signal.kind, descriptionType: signal.description?.type || null }));
+      return;
+    }
+
+    if (input.type === "stream_request") {
+      const host = lobby.members.get(lobby.hostConnectionId);
+      if (!host || me.slot === 1 || host.conn.id === conn.id) {
+        conn.send({ type: "protocol_error", code: "BAD_STREAM_REQUEST" });
+        return;
+      }
+      host.conn.send({ type: "stream_request", lobbyId: lobby.id, fromId: conn.id, player: memberSummary(me) });
+      console.log(JSON.stringify({ event: "stream_request_relay", lobbyId: lobby.id, fromId: conn.id, hostId: host.conn.id }));
       return;
     }
 

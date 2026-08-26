@@ -30,6 +30,7 @@ const state = {
   hostStreamPeers: new Map(),
   remoteStreamConnection: null,
   remoteStreamCandidates: [],
+  hostStreamRequestTimer: null,
   hostStreamTimer: null,
 };
 
@@ -316,16 +317,27 @@ function streamSignal(targetId, signal) {
   if (state.room && state.lobby) state.room.send({ type: "stream_signal", targetId, signal });
 }
 
+function requestHostStream() {
+  if (isHost() || !state.room || !state.lobby) return;
+  if (state.hostStreamRequestTimer) window.clearTimeout(state.hostStreamRequestTimer);
+  state.room.send({ type: "stream_request" });
+  log("host_stream_request_sent", { lobbyId: state.lobby.id });
+  state.hostStreamRequestTimer = window.setTimeout(() => {
+    const video = $("remoteGame");
+    if (!video?.srcObject) requestHostStream();
+  }, 4000);
+}
+
 function closeHostStreamPeer(peerId) {
   const connection = state.hostStreamPeers.get(peerId);
   if (connection) connection.close();
   state.hostStreamPeers.delete(peerId);
 }
 
-function closeRemoteStream() {
+function closeRemoteStream(clearCandidates = true) {
   if (state.remoteStreamConnection) state.remoteStreamConnection.close();
   state.remoteStreamConnection = null;
-  state.remoteStreamCandidates = [];
+  if (clearCandidates) state.remoteStreamCandidates = [];
   const video = $("remoteGame");
   video.pause();
   video.srcObject = null;
@@ -335,6 +347,8 @@ function closeRemoteStream() {
 function closeAllStreams() {
   if (state.hostStreamTimer) window.clearTimeout(state.hostStreamTimer);
   state.hostStreamTimer = null;
+  if (state.hostStreamRequestTimer) window.clearTimeout(state.hostStreamRequestTimer);
+  state.hostStreamRequestTimer = null;
   for (const peerId of state.hostStreamPeers.keys()) closeHostStreamPeer(peerId);
   if (state.hostStream) state.hostStream.getTracks().forEach((track) => track.stop());
   state.hostStream = null;
@@ -376,17 +390,18 @@ async function ensureHostStreams() {
   await Promise.all(peers.map((player) => startHostStreamForPeer(player)));
 }
 
-async function startHostStreamForPeer(peer) {
+async function startHostStreamForPeer(peer, force = false) {
   const existing = state.hostStreamPeers.get(peer.id);
-  if (existing && !["failed", "closed"].includes(existing.connectionState)) return;
+  if (existing && !force && !["failed", "closed"].includes(existing.connectionState)) return;
   if (existing) closeHostStreamPeer(peer.id);
-  const connection = new RTCPeerConnection(STREAM_CONFIG);
+  const connection = new window.RTCPeerConnection(STREAM_CONFIG);
   state.hostStreamPeers.set(peer.id, connection);
   for (const track of state.hostStream.getTracks()) connection.addTrack(track, state.hostStream);
   connection.onicecandidate = ({ candidate }) => {
     if (candidate) streamSignal(peer.id, { kind: "candidate", candidate: candidate.toJSON ? candidate.toJSON() : candidate });
   };
   connection.onconnectionstatechange = () => {
+    log("host_stream_connection_state", { peerId: peer.id, state: connection.connectionState });
     if (connection.connectionState === "failed") {
       log("host_stream_failed", { peerId: peer.id }, "WARN");
       closeHostStreamPeer(peer.id);
@@ -404,8 +419,27 @@ async function startHostStreamForPeer(peer) {
   }
 }
 
+async function handleStreamRequest(message) {
+  if (!isHost() || !state.lobby || message.lobbyId !== state.lobby.id || !message.fromId) return;
+  const peer = state.players.find((player) => player.id === message.fromId) || message.player;
+  if (!peer) return;
+  if (!state.players.some((player) => player.id === peer.id)) {
+    state.players = mergePlayers(state.players, [peer]);
+    renderPlayers();
+  }
+  log("host_stream_request_received", { peerId: message.fromId, slot: peer.slot });
+  if (!state.emulatorReady) {
+    scheduleHostStreams(250);
+    return;
+  }
+  await ensureHostStreams();
+  if (state.hostStream) await startHostStreamForPeer(peer, true);
+}
+
 function showRemoteStream(stream) {
   const video = $("remoteGame");
+  if (state.hostStreamRequestTimer) window.clearTimeout(state.hostStreamRequestTimer);
+  state.hostStreamRequestTimer = null;
   video.srcObject = stream;
   video.classList.remove("hidden");
   video.play().catch(() => {});
@@ -433,14 +467,17 @@ async function handleStreamSignal(message) {
   }
   try {
     if (signal.kind === "description" && signal.description?.type === "offer") {
-      closeRemoteStream();
-      const connection = new RTCPeerConnection(STREAM_CONFIG);
+      // Trickle ICE can arrive before the offer over the room transport.
+      // Keep those candidates until this description has been installed.
+      closeRemoteStream(false);
+      const connection = new window.RTCPeerConnection(STREAM_CONFIG);
       state.remoteStreamConnection = connection;
       connection.onicecandidate = ({ candidate }) => {
         if (candidate) streamSignal(fromId, { kind: "candidate", candidate: candidate.toJSON ? candidate.toJSON() : candidate });
       };
       connection.ontrack = ({ streams, track }) => showRemoteStream(streams[0] || new MediaStream([track]));
       connection.onconnectionstatechange = () => {
+        log("remote_stream_connection_state", { hostId: fromId, state: connection.connectionState });
         if (connection.connectionState === "failed") log("host_stream_failed", { peerId: fromId }, "ERROR");
       };
       await connection.setRemoteDescription(signal.description);
@@ -477,6 +514,7 @@ function handleRoomMessage(raw) {
     log("lobby_joined", { lobbyId: state.lobby.id, slot: state.self.slot, playerCount: state.players.length, authority: isHost() ? "host" : "host_stream" });
     toast(`Joined ${state.lobby.id} as P${state.self.slot}`);
     if (!isHost() && state.lobby.hostReady) $("emulatorStatus").textContent = "Waiting for live host feed…";
+    if (!isHost()) requestHostStream();
     announceHostReady();
     scheduleHostStreams();
     return;
@@ -494,7 +532,12 @@ function handleRoomMessage(raw) {
   if (message.type === "input_ack") { state.lastAck = message.seq; return; }
   if (message.type === "input_rejected") { log("input_rejected", message, "WARN"); return; }
   if (message.type === "protocol_error") { log("protocol_error", message, "ERROR"); return; }
-  if (message.type === "stream_signal") { handleStreamSignal(message); return; }
+  if (message.type === "stream_request") { handleStreamRequest(message); return; }
+  if (message.type === "stream_signal") {
+    log("host_stream_signal_received", { fromId: message.fromId, kind: message.signal?.kind, descriptionType: message.signal?.description?.type || null });
+    handleStreamSignal(message);
+    return;
+  }
   if (message.type === "host_emulator_ready") {
     if (!state.lobby || message.lobbyId !== state.lobby.id || message.romKey !== state.romMeta?.romKey) return;
     state.lobby.hostReady = true;
@@ -502,6 +545,7 @@ function handleRoomMessage(raw) {
     if (!isHost()) {
       $("emulatorStatus").textContent = "Waiting for live host feed…";
       $("bridgeBadge").textContent = "HOST STREAM";
+      requestHostStream();
     }
     scheduleHostStreams();
     return;
