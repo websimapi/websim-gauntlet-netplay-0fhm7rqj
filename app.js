@@ -11,7 +11,7 @@ const state = {
   self: null,
   players: [],
   logs: [],
-  input: { up: false, down: false, left: false, right: false, a: false, b: false, z: false, start: false, cUp: false, cDown: false, cLeft: false, cRight: false },
+  input: { up: false, down: false, left: false, right: false, dUp: false, dDown: false, dLeft: false, dRight: false, a: false, b: false, z: false, start: false, l: false, r: false, cUp: false, cDown: false, cLeft: false, cRight: false },
   seq: 0,
   lastSentInput: "",
   lastLoggedInput: "",
@@ -411,7 +411,7 @@ function applyRemoteInputs(players) {
   }
 }
 
-const controllerButtonMap = { a: 0, b: 8, z: 12, start: 3, up: 4, down: 5, left: 6, right: 7, cUp: 13, cDown: 14, cLeft: 15, cRight: 16 };
+const controllerButtonMap = { a: 0, b: 8, z: 12, start: 3, l: 10, r: 11, dUp: 4, dDown: 5, dLeft: 6, dRight: 7, up: 19, down: 18, left: 17, right: 16, cUp: 23, cDown: 22, cLeft: 21, cRight: 20 };
 
 function applyLocalInput() {
   const hook = getInputHook();
@@ -426,6 +426,25 @@ function getInputHook() {
   if (typeof window.EJS_emulator?.gameManager?.simulateInput === "function") return (port, input, value) => window.EJS_emulator.gameManager.simulateInput(port, input, value);
   if (typeof window.simulate_input === "function") return (port, input, value) => window.simulate_input(port, input, value);
   return null;
+}
+
+async function waitForEmulatorCapabilities() {
+  const startedAt = performance.now();
+  let stateCapabilitiesLogged = false;
+  for (let attempt = 0; attempt < 80; attempt += 1) {
+    const capabilities = { inputHook: Boolean(getInputHook()), getState: typeof window.EJS_emulator?.gameManager?.getState === "function", loadState: typeof window.EJS_emulator?.gameManager?.loadState === "function" };
+    if (capabilities.getState && capabilities.loadState && !stateCapabilitiesLogged) {
+      stateCapabilitiesLogged = true;
+      log("emulator_state_capabilities_ready", { ...capabilities, waitMs: Math.round(performance.now() - startedAt) });
+      applyPendingHostState();
+      if (state.self?.slot === 1 && state.players.length > 1) scheduleHostCheckpoint("capabilities_ready");
+    }
+    if (capabilities.inputHook) applyLocalInput();
+    if (capabilities.inputHook && capabilities.getState && capabilities.loadState) { log("emulator_capabilities_ready", { ...capabilities, waitMs: Math.round(performance.now() - startedAt) }); applyPendingHostState(); return; }
+    await new Promise((resolve) => window.setTimeout(resolve, 100));
+  }
+  log("emulator_capabilities_timeout", { inputHook: Boolean(getInputHook()), getState: typeof window.EJS_emulator?.gameManager?.getState === "function", loadState: typeof window.EJS_emulator?.gameManager?.loadState === "function", waitMs: Math.round(performance.now() - startedAt) }, "WARN");
+  applyPendingHostState();
 }
 
 function base64FromBytes(bytes) {
@@ -513,12 +532,15 @@ function sendInput(force = false) {
   if (signature !== state.lastLoggedInput || state.seq % 20 === 0) { state.lastLoggedInput = signature; log("input_sent", { seq: state.seq, buttons }); }
 }
 
-function setKey(key, pressed) { if (!(key in state.input)) return; state.input[key] = pressed; applyLocalInput(); sendInput(true); }
+function setKey(key, pressed) { if (!(key in state.input) || state.input[key] === pressed) return; state.input[key] = pressed; applyLocalInput(); sendInput(true); }
 
 function setupKeyboard() {
-  const keys = { w: "up", arrowup: "up", s: "down", arrowdown: "down", a: "left", arrowleft: "left", d: "right", arrowright: "right", j: "a", k: "b", q: "z", enter: "start", u: "cUp", i: "cRight", o: "cDown", p: "cLeft" };
+  const keys = { w: "up", arrowup: "up", s: "down", arrowdown: "down", a: "left", arrowleft: "left", d: "right", arrowright: "right", t: "dUp", g: "dDown", f: "dLeft", h: "dRight", j: "a", " ": "a", x: "a", k: "b", shift: "b", q: "z", z: "z", enter: "start", e: "l", r: "r", u: "cUp", i: "cRight", o: "cDown", p: "cLeft" };
+  const releaseKeys = () => { let changed = false; for (const key of Object.keys(state.input)) { if (state.input[key]) { state.input[key] = false; changed = true; } } if (changed) { applyLocalInput(); sendInput(true); log("input_reset", { reason: "window_blur" }); } };
   window.addEventListener("keydown", (event) => { const key = keys[event.key.toLowerCase()]; if (!key) return; event.preventDefault(); setKey(key, true); });
   window.addEventListener("keyup", (event) => { const key = keys[event.key.toLowerCase()]; if (!key) return; event.preventDefault(); setKey(key, false); });
+  window.addEventListener("blur", releaseKeys);
+  document.addEventListener("visibilitychange", () => { if (document.hidden) releaseKeys(); });
   window.setInterval(() => { if (state.self) sendInput(true); }, 100);
 }
 
@@ -543,13 +565,14 @@ async function launchEmulator(reason = "manual") {
   window.EJS_biosUrl = "";
   window.EJS_pathtodata = "https://cdn.emulatorjs.org/stable/data/";
   window.EJS_gameID = 64;
-  window.EJS_volume = 0.7;
+  window.EJS_volume = 0.5;
   window.EJS_threads = Boolean(window.crossOriginIsolated && window.SharedArrayBuffer);
-  window.EJS_defaultOptions = { ...(window.EJS_defaultOptions || {}), vsync: "disabled", shader: "disabled", webgl2Enabled: "enabled" };
+  window.EJS_disableLocalStorage = true;
+  window.EJS_defaultOptions = { ...(window.EJS_defaultOptions || {}), vsync: "enabled", shader: "disabled", webgl2Enabled: "enabled" };
   window.EJS_startOnLoaded = true;
   window.EJS_DEBUG_XX = true;
   window.EJS_controlScheme = "n64";
-  window.EJS_ready = () => { state.emulatorReady = true; $("bridgeCoreState").textContent = "READY"; $("bridgeCoreState").className = "ready"; $("bridgeBadge").textContent = "CORE READY"; $("bridgeBadge").classList.add("live"); $("emulatorStatus").textContent = "N64 core ready · local frame"; log("emulator_ready", { inputHook: Boolean(getInputHook()), getState: typeof window.EJS_emulator?.gameManager?.getState === "function", loadState: typeof window.EJS_emulator?.gameManager?.loadState === "function", threads: Boolean(window.EJS_threads), crossOriginIsolated: Boolean(window.crossOriginIsolated), volume: window.EJS_volume }); applyLocalInput(); applyPendingHostState(); if (state.self?.slot === 1) { state.room?.send({ type: "host_emulator_ready", romKey: state.romMeta?.romKey, patchProfile: state.romMeta?.patchProfile }); if (state.players.length > 1) scheduleHostCheckpoint("emulator_ready"); } };
+  window.EJS_ready = () => { state.emulatorReady = true; $("bridgeCoreState").textContent = "READY"; $("bridgeCoreState").className = "ready"; $("bridgeBadge").textContent = "CORE READY"; $("bridgeBadge").classList.add("live"); $("emulatorStatus").textContent = "N64 core ready · local frame"; log("emulator_ready", { inputHook: Boolean(getInputHook()), getState: typeof window.EJS_emulator?.gameManager?.getState === "function", loadState: typeof window.EJS_emulator?.gameManager?.loadState === "function", threads: Boolean(window.EJS_threads), crossOriginIsolated: Boolean(window.crossOriginIsolated), vsync: window.EJS_defaultOptions?.vsync, volume: window.EJS_volume }); if (state.self?.slot === 1) { state.room?.send({ type: "host_emulator_ready", romKey: state.romMeta?.romKey, patchProfile: state.romMeta?.patchProfile }); } waitForEmulatorCapabilities(); };
   window.EJS_onExit = () => { state.emulatorStarted = false; state.emulatorReady = false; $("emulatorStatus").textContent = "Emulator exited"; log("emulator_exit"); };
   if (state.emulatorScript) state.emulatorScript.remove();
   const script = document.createElement("script");

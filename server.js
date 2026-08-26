@@ -1,5 +1,5 @@
 const MAX_PLAYERS = 4;
-const INPUT_KEYS = ["up", "down", "left", "right", "a", "b", "z", "start", "cUp", "cDown", "cLeft", "cRight"];
+const INPUT_KEYS = ["up", "down", "left", "right", "dUp", "dDown", "dLeft", "dRight", "a", "b", "z", "start", "l", "r", "cUp", "cDown", "cLeft", "cRight"];
 const activeLobbies = new Map();
 const connectionLobbies = new Map();
 
