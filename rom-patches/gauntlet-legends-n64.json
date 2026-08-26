@@ -1,0 +1,17 @@
+{
+  "id": "gl-n64-websim-bridge-0.1",
+  "game": "Gauntlet Legends",
+  "system": "Nintendo 64",
+  "description": "Safe, signature-checked patch manifest for the Websim host-sync adapter.",
+  "romSha256": null,
+  "patches": [],
+  "contract": {
+    "required": [
+      "stable ROM fingerprint",
+      "server-sanitized controller port input",
+      "host savestate checkpoints",
+      "frame checkpoint hook for deterministic anti-cheat"
+    ],
+    "note": "Add only exact expected/replacement byte pairs after a tested ROM-mod build. Never patch without an expected byte signature."
+  }
+}

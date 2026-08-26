@@ -4,6 +4,8 @@ const state = {
   rom: null,
   romMeta: null,
   romUrl: null,
+  romLaunchBlob: null,
+  patchManifest: null,
   room: null,
   lobby: null,
   self: null,
@@ -16,6 +18,11 @@ const state = {
   emulatorStarted: false,
   emulatorReady: false,
   emulatorScript: null,
+  incomingStateSync: null,
+  pendingHostState: null,
+  stateSyncInFlight: false,
+  lastPlayerCount: 0,
+  hostCheckpointTimer: null,
 };
 
 const $ = (id) => document.getElementById(id);
@@ -62,6 +69,76 @@ function readAscii(bytes, start, length) {
   return [...bytes.slice(start, start + length)].map((value) => value >= 32 && value <= 126 ? String.fromCharCode(value) : " ").join("").replace(/\s+/g, " ").trim();
 }
 
+async function sha256Hex(value) {
+  const data = value instanceof ArrayBuffer ? value : value.buffer.slice(value.byteOffset, value.byteOffset + value.byteLength);
+  const hashBuffer = await crypto.subtle.digest("SHA-256", data);
+  return [...new Uint8Array(hashBuffer)].map((byte) => byte.toString(16).padStart(2, "0")).join("");
+}
+
+async function extractZipRom(file) {
+  const header = new Uint8Array(await file.slice(0, 65536).arrayBuffer());
+  const findSignature = (bytes, signature, fromEnd = false) => {
+    const start = fromEnd ? bytes.length - 4 : 0;
+    for (let index = start; fromEnd ? index >= 0 : index < bytes.length - 4; index += fromEnd ? -1 : 1) {
+      if (bytes[index] === signature[0] && bytes[index + 1] === signature[1] && bytes[index + 2] === signature[2] && bytes[index + 3] === signature[3]) return index;
+    }
+    return -1;
+  };
+  let localOffset = findSignature(header, [0x50, 0x4b, 0x03, 0x04]);
+  if (localOffset < 0) throw new Error("ZIP has no readable local file entry");
+  const local = new DataView(header.buffer, localOffset);
+  let compression = local.getUint16(8, true);
+  let compressedSize = local.getUint32(18, true);
+  const fileNameLength = local.getUint16(26, true);
+  const extraLength = local.getUint16(28, true);
+  let dataOffset = localOffset + 30 + fileNameLength + extraLength;
+  if (!compressedSize) {
+    const tailStart = Math.max(0, file.size - 131072);
+    const tail = new Uint8Array(await file.slice(tailStart).arrayBuffer());
+    const centralOffset = findSignature(tail, [0x50, 0x4b, 0x01, 0x02], true);
+    if (centralOffset >= 0) {
+      const central = new DataView(tail.buffer, centralOffset);
+      compression = central.getUint16(10, true);
+      compressedSize = central.getUint32(20, true);
+      localOffset = central.getUint32(42, true);
+      const localHeader = new DataView(header.buffer, localOffset);
+      const localNameLength = localHeader.getUint16(26, true);
+      const localExtraLength = localHeader.getUint16(28, true);
+      dataOffset = localOffset + 30 + localNameLength + localExtraLength;
+    }
+  }
+  if (!compressedSize || dataOffset + compressedSize > file.size) throw new Error("ZIP entry is incomplete or uses an unsupported layout");
+  const compressed = await file.slice(dataOffset, dataOffset + compressedSize).arrayBuffer();
+  if (compression === 0) return new Uint8Array(compressed);
+  if (compression !== 8 || typeof DecompressionStream === "undefined") throw new Error("ZIP compression is not browser-decompressible");
+  const stream = new Blob([compressed]).stream().pipeThrough(new DecompressionStream("deflate-raw"));
+  return new Uint8Array(await new Response(stream).arrayBuffer());
+}
+
+function hexBytes(value) {
+  const normalized = String(value || "").replace(/[^0-9a-f]/gi, "");
+  if (normalized.length % 2) throw new Error("Patch hex must contain whole bytes");
+  return new Uint8Array(normalized.match(/.{2}/g)?.map((pair) => parseInt(pair, 16)) || []);
+}
+
+function applyPatchManifest(bytes, manifest, rawHash) {
+  const profile = manifest?.id || "gl-n64-websim-bridge-0.1";
+  if (manifest?.romSha256 && manifest.romSha256.toLowerCase() !== rawHash) return { bytes, profile, status: "HASH NOT TARGETED", applied: 0 };
+  const patches = Array.isArray(manifest?.patches) ? manifest.patches : [];
+  const patched = new Uint8Array(bytes);
+  let applied = 0;
+  for (const patch of patches) {
+    const offset = Number(patch.offset);
+    const expected = hexBytes(patch.expectHex);
+    const replacement = hexBytes(patch.replaceHex);
+    if (!Number.isSafeInteger(offset) || offset < 0 || expected.length === 0 || expected.length !== replacement.length || offset + expected.length > patched.length) return { bytes, profile, status: "PATCH REJECTED", applied: 0, error: `Invalid patch: ${patch.label || "unnamed"}` };
+    for (let index = 0; index < expected.length; index += 1) if (patched[offset + index] !== expected[index]) return { bytes, profile, status: "PATCH REJECTED", applied: 0, error: `Signature mismatch: ${patch.label || `offset ${offset}`}` };
+    patched.set(replacement, offset);
+    applied += 1;
+  }
+  return { bytes: patched, profile, status: patches.length ? `PATCHED ${applied}/${patches.length}` : "READY / NO PATCHES", applied };
+}
+
 function identifyRom(file, bytes) {
   const magic = [...bytes.slice(0, 4)].map((value) => value.toString(16).padStart(2, "0")).join("").toUpperCase();
   const extension = file.name.split(".").pop()?.toLowerCase() || "";
@@ -78,24 +155,44 @@ function identifyRom(file, bytes) {
 
 async function handleRom(file) {
   if (!file) return;
-  state.rom = file;
-  const bytes = new Uint8Array(await file.slice(0, Math.min(file.size, 1024 * 1024)).arrayBuffer());
-  const meta = identifyRom(file, bytes);
-  const hashBuffer = await crypto.subtle.digest("SHA-256", await file.arrayBuffer());
-  const hash = [...new Uint8Array(hashBuffer)].map((value) => value.toString(16).padStart(2, "0")).join("");
-  state.romMeta = { ...meta, hash, size: file.size, name: file.name, lastModified: file.lastModified };
-  $("romCard").classList.remove("hidden");
-  $("romName").textContent = file.name;
-  $("romSize").textContent = formatBytes(file.size);
-  $("romFormat").textContent = meta.format;
-  $("romHash").textContent = hash.slice(0, 18) + "…";
-  $("romTitle").textContent = meta.title;
-  $("romCheck").textContent = meta.looksLikeGauntlet ? "GAUNTLET MATCH" : (meta.headerOk ? "N64 HEADER FOUND" : "CHECK FILE");
-  $("romCheck").classList.toggle("warn", !meta.looksLikeGauntlet);
-  $("launchButton").disabled = false;
-  $("bridgeRomState").textContent = meta.looksLikeGauntlet ? "MATCH" : "VERIFY";
-  $("bridgeRomState").className = meta.looksLikeGauntlet ? "ready" : "amber";
-  log("rom_inspected", { name: file.name, bytes: file.size, magic: meta.magic, format: meta.format, title: meta.title, sha256: hash, gauntletNameMatch: meta.looksLikeGauntlet });
+  try {
+    state.rom = file;
+    const signature = new Uint8Array(await file.slice(0, 4).arrayBuffer());
+    const isZip = file.name.toLowerCase().endsWith(".zip") || (signature[0] === 0x50 && signature[1] === 0x4b && signature[2] === 0x03 && signature[3] === 0x04);
+    const rawBytes = isZip ? await extractZipRom(file) : new Uint8Array(await file.arrayBuffer());
+    const rawMeta = identifyRom(file, rawBytes);
+    const rawHash = await sha256Hex(rawBytes);
+    const fileHash = await sha256Hex(await file.arrayBuffer());
+    const manifestResponse = await fetch("/rom-patches/gauntlet-legends-n64.json", { cache: "no-store" });
+    state.patchManifest = manifestResponse.ok ? await manifestResponse.json() : { id: "gl-n64-websim-bridge-0.1", patches: [] };
+    const patch = applyPatchManifest(rawBytes, state.patchManifest, rawHash);
+    const valid = rawMeta.headerOk && rawMeta.looksLikeGauntlet && !patch.error;
+    state.romLaunchBlob = patch.applied ? new Blob([patch.bytes], { type: "application/octet-stream" }) : file;
+    state.romMeta = { ...rawMeta, containerFormat: isZip ? "ZIP CONTAINER" : rawMeta.format, hash: fileHash, rawSha256: rawHash, romKey: rawHash, size: file.size, name: file.name, lastModified: file.lastModified, valid, patchProfile: patch.profile, patchStatus: patch.status, patchError: patch.error || null };
+    $("romFormat").textContent = isZip ? `ZIP → ${rawMeta.format.split(" /")[0]}` : rawMeta.format;
+    $("romCard").classList.remove("hidden");
+    $("romName").textContent = file.name;
+    $("romSize").textContent = formatBytes(file.size);
+    $("romHash").textContent = rawHash.slice(0, 18) + "…";
+    $("romTitle").textContent = rawMeta.title;
+    $("romPatch").textContent = patch.status;
+    $("romPatch").className = patch.error ? "amber" : "ready";
+    $("romCheck").textContent = valid ? "VALID GAUNTLET ROM" : "ROM REJECTED";
+    $("romCheck").classList.toggle("warn", !valid);
+    $("launchButton").disabled = !valid;
+    $("bridgeRomState").textContent = valid ? "VALID" : "REJECT";
+    $("bridgeRomState").className = valid ? "ready" : "amber";
+    log("rom_inspected", { name: file.name, bytes: file.size, rawBytes: rawBytes.byteLength, magic: rawMeta.magic, format: rawMeta.format, title: rawMeta.title, rawSha256: rawHash, fileSha256: fileHash, valid, patchProfile: patch.profile, patchStatus: patch.status, patchError: patch.error || null });
+    if (!valid) throw new Error(patch.error || "This file is not a validated Gauntlet Legends N64 ROM.");
+  } catch (error) {
+    state.romMeta = { name: file.name, size: file.size, valid: false, patchStatus: "FAILED", patchError: error.message };
+    $("launchButton").disabled = true;
+    $("romCheck").textContent = "ROM REJECTED";
+    $("romCheck").classList.add("warn");
+    log("rom_validation_error", { name: file.name, message: error.message }, "ERROR");
+    toast(error.message);
+    return;
+  }
 }
 
 function buildReport() {
@@ -106,7 +203,7 @@ function buildReport() {
     viewport: `${window.innerWidth}x${window.innerHeight}`,
     rom: state.romMeta ? { ...state.romMeta } : null,
     connection: { lobby: state.lobby?.id || null, self: state.self, players: state.players.map(({ id, username, slot, seq }) => ({ id, username, slot, seq })), lastAck: state.lastAck },
-    emulator: { started: state.emulatorStarted, ready: state.emulatorReady, EJS: Boolean(window.EJS_emulator), gameManager: Boolean(window.EJS_emulator?.gameManager), simulateInput: typeof window.EJS_emulator?.gameManager?.simulateInput === "function" },
+    emulator: { started: state.emulatorStarted, ready: state.emulatorReady, EJS: Boolean(window.EJS_emulator), gameManager: Boolean(window.EJS_emulator?.gameManager), simulateInput: typeof window.EJS_emulator?.gameManager?.simulateInput === "function", globalSimulateInput: typeof window.simulate_input === "function", inputHook: Boolean(getInputHook()), getState: typeof window.EJS_emulator?.gameManager?.getState === "function", loadState: typeof window.EJS_emulator?.gameManager?.loadState === "function" },
     protocol: { name: "input-authority/0.1", inputSequence: state.seq, currentInput: state.input },
     recentLogs: state.logs.slice(-80),
   }, null, 2);
@@ -117,7 +214,7 @@ function renderPlayers() {
   const playersBySlot = new Map(state.players.map((player) => [player.slot, player]));
   slots.innerHTML = [1, 2, 3, 4].map((slot) => {
     const player = playersBySlot.get(slot);
-    const label = player ? (player.id === state.self?.id ? `${player.username || "YOU"} · YOU` : player.username || "PLAYER") : "OPEN SLOT";
+    const label = player ? (player.id === state.self?.id ? `${player.username || "YOU"} · YOU${slot === 1 ? " · HOST" : ""}` : `${player.username || "PLAYER"}${slot === 1 ? " · HOST" : ""}`) : "OPEN SLOT";
     return `<div class="player-slot ${player ? "active" : ""}"><span class="slot-number">P${slot}</span><span class="slot-name">${escapeHtml(label)}</span></div>`;
   }).join("");
 }
@@ -143,6 +240,7 @@ async function refreshLobbies() {
 
 async function createLobby() {
   if (!state.user) { toast("Sign in to create a lobby"); log("lobby_create_blocked", { reason: "signed_out" }, "WARN"); return; }
+  if (!state.romMeta?.valid) { toast("Load a valid Gauntlet ROM first"); log("lobby_create_blocked", { reason: "valid_rom_required" }, "WARN"); return; }
   try {
     const response = await fetch("/api/lobbies", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ visibility: state.selectedVisibility }) });
     const body = await response.json();
@@ -172,10 +270,11 @@ async function joinLobby(code) {
   const lobbyId = String(code || $("lobbyCodeInput").value).trim().toUpperCase();
   if (!lobbyId) { toast("Enter a lobby code"); return; }
   if (!state.user) { toast("Sign in to join a lobby"); log("lobby_join_blocked", { reason: "signed_out", lobbyId }, "WARN"); return; }
+  if (!state.romMeta?.valid) { toast("Load a valid Gauntlet ROM first"); log("lobby_join_blocked", { reason: "valid_rom_required", lobbyId }, "WARN"); return; }
   try {
     const room = await connectRoom();
-    room.send({ type: "join_lobby", lobbyId });
-    log("join_lobby_sent", { lobbyId });
+    room.send({ type: "join_lobby", lobbyId, romKey: state.romMeta.romKey, romValid: true, patchProfile: state.romMeta.patchProfile });
+    log("join_lobby_sent", { lobbyId, romKey: state.romMeta.romKey, patchProfile: state.romMeta.patchProfile });
   } catch (error) { log("room_connect_error", { message: error.message }, "ERROR"); setConnection("error", "CONNECT ERROR"); toast(error.message); }
 }
 
@@ -184,6 +283,7 @@ function handleRoomMessage(raw) {
   try { message = typeof raw === "string" ? JSON.parse(raw) : raw; } catch { log("room_bad_message", { raw: String(raw).slice(0, 200) }, "ERROR"); return; }
   if (message.type === "connected") { log("server_hello", { protocol: message.protocol, connectionId: message.connectionId }); return; }
   if (message.type === "joined_lobby") {
+    const previousCount = state.players.length;
     state.lobby = message.lobby;
     state.self = message.self;
     state.players = message.players || [];
@@ -193,14 +293,51 @@ function handleRoomMessage(raw) {
     renderPlayers();
     log("lobby_joined", { lobbyId: state.lobby.id, slot: state.self.slot, playerCount: state.players.length });
     toast(`Joined ${state.lobby.id} as P${state.self.slot}`);
+    if (state.self.slot === 1 && state.players.length > previousCount) scheduleHostCheckpoint("joiner_connected");
     return;
   }
-  if (message.type === "lobby_state") { state.lobby = message.lobby; state.players = message.players || []; renderPlayers(); log("lobby_state", { lobbyId: message.lobby.id, playerCount: state.players.length }); return; }
+  if (message.type === "lobby_state") {
+    const previousCount = state.players.length;
+    state.lobby = message.lobby;
+    state.players = message.players || [];
+    renderPlayers();
+    log("lobby_state", { lobbyId: message.lobby.id, playerCount: state.players.length, stateVersion: message.lobby.stateVersion || 0 });
+    if (state.self?.slot === 1 && state.players.length > previousCount) scheduleHostCheckpoint("joiner_connected");
+    return;
+  }
   if (message.type === "join_rejected") { log("join_rejected", { code: message.code, message: message.message }, "WARN"); toast(message.message); return; }
   if (message.type === "input_ack") { state.lastAck = message.seq; return; }
   if (message.type === "input_rejected") { log("input_rejected", message, "WARN"); return; }
   if (message.type === "protocol_error") { log("protocol_error", message, "ERROR"); return; }
+  if (message.type === "state_sync_rejected") { log("state_sync_rejected", message, "ERROR"); return; }
+  if (message.type === "host_state_begin") {
+    if (message.romKey !== state.romMeta?.romKey) { log("host_state_rom_mismatch", { expected: state.romMeta?.romKey, received: message.romKey }, "ERROR"); return; }
+    state.incomingStateSync = { syncId: message.syncId, totalBytes: message.totalBytes, totalChunks: message.totalChunks, stateTick: message.stateTick, chunks: new Array(message.totalChunks), received: 0 };
+    log("host_state_begin", { syncId: message.syncId, totalBytes: message.totalBytes, totalChunks: message.totalChunks, stateTick: message.stateTick });
+    return;
+  }
+  if (message.type === "host_state_chunk") {
+    const sync = state.incomingStateSync;
+    if (!sync || sync.syncId !== message.syncId || sync.chunks[message.index]) return;
+    sync.chunks[message.index] = message.data;
+    sync.received += 1;
+    return;
+  }
+  if (message.type === "host_state_end") {
+    const sync = state.incomingStateSync;
+    if (!sync || sync.syncId !== message.syncId || sync.received !== sync.totalChunks) { log("host_state_incomplete", { syncId: message.syncId, received: sync?.received || 0, expected: sync?.totalChunks || 0 }, "ERROR"); return; }
+    const bytes = new Uint8Array(sync.totalBytes);
+    let offset = 0;
+    try { for (const chunk of sync.chunks) { const decoded = bytesFromBase64(chunk); bytes.set(decoded, offset); offset += decoded.length; } }
+    catch (error) { log("host_state_decode_error", { syncId: sync.syncId, message: error.message }, "ERROR"); return; }
+    state.incomingStateSync = null;
+    state.pendingHostState = { bytes, stateTick: message.stateTick, stateVersion: message.stateVersion };
+    log("host_state_received", { syncId: message.syncId, bytes: bytes.byteLength, stateTick: message.stateTick, stateVersion: message.stateVersion });
+    applyPendingHostState();
+    return;
+  }
   if (message.type === "snapshot") {
+    state.lastServerTick = message.tick;
     state.players = message.players || state.players;
     renderPlayers();
     const selfFrame = state.players.find((player) => player.id === state.self?.id);
@@ -211,15 +348,73 @@ function handleRoomMessage(raw) {
 }
 
 function applyRemoteInputs(players) {
-  if (!window.EJS_emulator?.gameManager?.simulateInput) return;
+  const hook = getInputHook();
+  if (!hook) return;
   const map = { a: 0, b: 8, z: 12, start: 3, up: 4, down: 5, left: 6, right: 7, cUp: 13, cDown: 14, cLeft: 15, cRight: 16 };
   for (const player of players) {
     if (player.id === state.self?.id || !player.input) continue;
     for (const [key, value] of Object.entries(player.input.buttons || {})) {
       if (!(key in map)) continue;
-      try { window.EJS_emulator.gameManager.simulateInput(Math.max(0, player.slot - 1), map[key], value ? 1 : 0); } catch (error) { log("remote_input_hook_error", { player: player.slot, key, message: error.message }, "WARN"); }
+      try { hook(Math.max(0, player.slot - 1), map[key], value ? 1 : 0); } catch (error) { log("remote_input_hook_error", { player: player.slot, key, message: error.message }, "WARN"); }
     }
   }
+}
+
+function getInputHook() {
+  if (typeof window.EJS_emulator?.gameManager?.simulateInput === "function") return (port, input, value) => window.EJS_emulator.gameManager.simulateInput(port, input, value);
+  if (typeof window.simulate_input === "function") return (port, input, value) => window.simulate_input(port, input, value);
+  return null;
+}
+
+function base64FromBytes(bytes) {
+  let binary = "";
+  const chunkSize = 0x8000;
+  for (let index = 0; index < bytes.length; index += chunkSize) binary += String.fromCharCode(...bytes.subarray(index, index + chunkSize));
+  return btoa(binary);
+}
+
+function bytesFromBase64(value) {
+  const binary = atob(value);
+  const bytes = new Uint8Array(binary.length);
+  for (let index = 0; index < binary.length; index += 1) bytes[index] = binary.charCodeAt(index);
+  return bytes;
+}
+
+function scheduleHostCheckpoint(reason) {
+  if (state.hostCheckpointTimer) window.clearTimeout(state.hostCheckpointTimer);
+  state.hostCheckpointTimer = window.setTimeout(() => sendHostCheckpoint(reason), 600);
+}
+
+async function sendHostCheckpoint(reason = "periodic") {
+  if (state.stateSyncInFlight || !state.self || state.self.slot !== 1 || !state.lobby || !state.emulatorReady || state.players.length < 2) return;
+  const gameManager = window.EJS_emulator?.gameManager;
+  if (typeof gameManager?.getState !== "function") { log("host_state_unavailable", { reason, getState: false }, "WARN"); return; }
+  state.stateSyncInFlight = true;
+  try {
+    if (typeof window.EJS_emulator.pause === "function") window.EJS_emulator.pause();
+    await new Promise((resolve) => window.setTimeout(resolve, 60));
+    const rawState = gameManager.getState();
+    const bytes = rawState instanceof Uint8Array ? rawState : new Uint8Array(rawState);
+    if (!bytes.byteLength || bytes.byteLength > 4 * 1024 * 1024) throw new Error(`Savestate is ${bytes.byteLength} bytes; room limit is 4 MB`);
+    const chunkSize = 24000;
+    const totalChunks = Math.ceil(bytes.byteLength / chunkSize);
+    const syncId = `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+    state.room.send({ type: "host_state_begin", syncId, totalBytes: bytes.byteLength, totalChunks, stateTick: state.lastServerTick || 0 });
+    for (let index = 0; index < totalChunks; index += 1) { state.room.send({ type: "host_state_chunk", syncId, index, data: base64FromBytes(bytes.subarray(index * chunkSize, Math.min(bytes.byteLength, (index + 1) * chunkSize))) }); await new Promise((resolve) => window.setTimeout(resolve, 8)); }
+    state.room.send({ type: "host_state_end", syncId, stateTick: state.lastServerTick || 0 });
+    log("host_state_sent", { reason, syncId, bytes: bytes.byteLength, totalChunks });
+  } catch (error) { log("host_state_error", { reason, message: error.message }, "ERROR"); }
+  finally { state.stateSyncInFlight = false; if (typeof window.EJS_emulator.play === "function") window.EJS_emulator.play(); }
+}
+
+async function applyPendingHostState() {
+  if (!state.pendingHostState || !state.emulatorReady) return;
+  const gameManager = window.EJS_emulator?.gameManager;
+  if (typeof gameManager?.loadState !== "function") { log("host_state_apply_unavailable", { loadState: false }, "ERROR"); return; }
+  const pending = state.pendingHostState;
+  state.pendingHostState = null;
+  try { await gameManager.loadState(pending.bytes); $("emulatorStatus").textContent = `Synced to host · state ${pending.stateVersion}`; $("bridgeBadge").textContent = "HOST SYNCED"; log("host_state_applied", { bytes: pending.bytes.byteLength, stateTick: pending.stateTick, stateVersion: pending.stateVersion }); }
+  catch (error) { log("host_state_apply_error", { message: error.message }, "ERROR"); }
 }
 
 function inputSignature() { return JSON.stringify(state.input); }
@@ -247,7 +442,7 @@ async function launchEmulator() {
   if (!state.rom) return;
   if (typeof window.EJS_terminate === "function") { try { window.EJS_terminate(); } catch {} }
   if (state.romUrl) URL.revokeObjectURL(state.romUrl);
-  state.romUrl = URL.createObjectURL(state.rom);
+  state.romUrl = URL.createObjectURL(state.romLaunchBlob || state.rom);
   const game = $("game");
   game.innerHTML = "";
   state.emulatorStarted = true;
@@ -266,7 +461,7 @@ async function launchEmulator() {
   window.EJS_startOnLoaded = true;
   window.EJS_DEBUG_XX = true;
   window.EJS_controlScheme = "n64";
-  window.EJS_ready = () => { state.emulatorReady = true; $("bridgeCoreState").textContent = "READY"; $("bridgeCoreState").className = "ready"; $("bridgeBadge").textContent = "CORE READY"; $("bridgeBadge").classList.add("live"); $("emulatorStatus").textContent = "N64 core ready · local frame"; log("emulator_ready", { simulateInput: typeof window.EJS_emulator?.gameManager?.simulateInput === "function" }); };
+  window.EJS_ready = () => { state.emulatorReady = true; $("bridgeCoreState").textContent = "READY"; $("bridgeCoreState").className = "ready"; $("bridgeBadge").textContent = "CORE READY"; $("bridgeBadge").classList.add("live"); $("emulatorStatus").textContent = "N64 core ready · local frame"; log("emulator_ready", { inputHook: Boolean(getInputHook()), getState: typeof window.EJS_emulator?.gameManager?.getState === "function", loadState: typeof window.EJS_emulator?.gameManager?.loadState === "function" }); applyPendingHostState(); if (state.self?.slot === 1 && state.players.length > 1) scheduleHostCheckpoint("emulator_ready"); };
   window.EJS_onExit = () => { state.emulatorStarted = false; state.emulatorReady = false; $("emulatorStatus").textContent = "Emulator exited"; log("emulator_exit"); };
   if (state.emulatorScript) state.emulatorScript.remove();
   const script = document.createElement("script");
@@ -308,7 +503,7 @@ function bindUI() {
 }
 
 async function boot() {
-  bindUI(); setupKeyboard(); window.setInterval(tickClock, 1000); refreshLobbies();
+  bindUI(); setupKeyboard(); window.setInterval(tickClock, 1000); window.setInterval(() => { if (state.self?.slot === 1 && state.players.length > 1) scheduleHostCheckpoint("periodic"); }, 10000); refreshLobbies();
   try { state.user = await window.websim?.getUser?.(); log("identity_loaded", { signedIn: Boolean(state.user), username: state.user?.username || null }); }
   catch (error) { log("identity_error", { message: error.message }, "WARN"); }
   log("client_ready", { browser: navigator.userAgent, protocol: "input-authority/0.1" });

@@ -1,6 +1,7 @@
 const MAX_PLAYERS = 4;
 const INPUT_KEYS = ["up", "down", "left", "right", "a", "b", "z", "start", "cUp", "cDown", "cLeft", "cRight"];
 const activeLobbies = new Map();
+const connectionLobbies = new Map();
 
 export const schema = `
   CREATE TABLE IF NOT EXISTS lobbies (
@@ -44,6 +45,9 @@ function lobbySummary(lobby) {
     maxPlayers: MAX_PLAYERS,
     playerCount: lobby.members ? lobby.members.size : 0,
     host: lobby.username,
+    romKey: lobby.romKey || null,
+    patchProfile: lobby.patchProfile || null,
+    stateVersion: lobby.stateVersion || 0,
   };
 }
 
@@ -58,6 +62,16 @@ function publicPlayers(lobby) {
 async function broadcastLobby(lobby) {
   const message = { type: "lobby_state", lobby: lobbySummary(lobby), players: publicPlayers(lobby), serverTime: Date.now() };
   for (const member of lobby.members.values()) member.conn.send(message);
+}
+
+async function sendStateSyncToMember(lobby, member) {
+  const sync = lobby.stateSync;
+  if (!sync) return;
+  member.conn.send({ type: "host_state_begin", syncId: sync.syncId, totalBytes: sync.totalBytes, totalChunks: sync.totalChunks, stateTick: sync.stateTick, romKey: sync.romKey, patchProfile: sync.patchProfile });
+  for (let index = 0; index < sync.chunks.length; index += 1) {
+    if (sync.chunks[index]) member.conn.send({ type: "host_state_chunk", syncId: sync.syncId, index, data: sync.chunks[index] });
+  }
+  if (sync.received === sync.totalChunks) member.conn.send({ type: "host_state_end", syncId: sync.syncId, stateVersion: lobby.stateVersion, stateTick: sync.stateTick, serverTime: Date.now() });
 }
 
 function sanitizeInput(raw, lastSeq) {
@@ -147,24 +161,32 @@ export const room = {
       if (!row || row.status !== "open") { conn.send({ type: "join_rejected", code: "LOBBY_NOT_FOUND", message: "That lobby is closed or missing." }); return; }
       let lobby = activeLobbies.get(lobbyId);
       if (!lobby) {
-        lobby = { id: lobbyId, visibility: row.visibility, username: row.username, members: new Map(), createdAt: Date.now(), tick: 0 };
+        lobby = { id: lobbyId, visibility: row.visibility, username: row.username, members: new Map(), createdAt: Date.now(), tick: 0, stateVersion: 0, hostConnectionId: null, stateSync: null };
         activeLobbies.set(lobbyId, lobby);
       }
       if (lobby.members.size >= MAX_PLAYERS) { conn.send({ type: "join_rejected", code: "LOBBY_FULL", message: "That lobby already has four players." }); return; }
       for (const member of lobby.members.values()) if (member.userId === conn.userId) { conn.send({ type: "join_rejected", code: "ALREADY_JOINED", message: "You are already in this lobby." }); return; }
       const usedSlots = new Set([...lobby.members.values()].map((member) => member.slot));
       const slot = [1, 2, 3, 4].find((candidate) => !usedSlots.has(candidate));
-      const member = { conn, userId: conn.userId, username: conn.username || "player", slot, lastSeq: -1, latestInput: null, joinedAt: Date.now() };
+      const romKey = String(input.romKey || "").toLowerCase();
+      const patchProfile = String(input.patchProfile || "").slice(0, 80);
+      if (input.romValid !== true || !/^[a-f0-9]{64}$/.test(romKey)) { conn.send({ type: "join_rejected", code: "ROM_REQUIRED", message: "Load and validate the Gauntlet Legends ROM before joining." }); return; }
+      if (lobby.romKey && lobby.romKey !== romKey) { conn.send({ type: "join_rejected", code: "ROM_MISMATCH", message: "Your ROM fingerprint does not match the host's ROM." }); return; }
+      if (!lobby.romKey) { lobby.romKey = romKey; lobby.patchProfile = patchProfile || "gl-n64-websim-bridge-0.1"; }
+      const member = { conn, userId: conn.userId, username: conn.username || "player", slot, lastSeq: -1, latestInput: null, joinedAt: Date.now(), romKey, patchProfile };
       lobby.members.set(conn.id, member);
-      conn.lobbyId = lobbyId;
+      connectionLobbies.set(conn.id, lobbyId);
+      if (!lobby.hostConnectionId || slot === 1) lobby.hostConnectionId = slot === 1 ? conn.id : lobby.hostConnectionId;
       await env.DB.prepare("UPDATE lobbies SET last_seen_at = ? WHERE id = ?").bind(Date.now(), lobbyId).run();
       conn.send({ type: "joined_lobby", lobby: lobbySummary(lobby), self: memberSummary(member), players: publicPlayers(lobby), serverTime: Date.now() });
       await broadcastLobby(lobby);
+      if (lobby.stateSync) await sendStateSyncToMember(lobby, member);
       console.log(JSON.stringify({ event: "lobby_joined", lobbyId, connectionId: conn.id, slot, playerCount: lobby.members.size }));
       return;
     }
 
-    const lobby = conn.lobbyId ? activeLobbies.get(conn.lobbyId) : null;
+    const lobbyId = connectionLobbies.get(conn.id);
+    const lobby = lobbyId ? activeLobbies.get(lobbyId) : null;
     const me = lobby ? lobby.members.get(conn.id) : null;
     if (!me) { conn.send({ type: "protocol_error", code: "JOIN_REQUIRED" }); return; }
 
@@ -174,6 +196,33 @@ export const room = {
       me.lastSeq = sanitized.seq;
       me.latestInput = sanitized;
       conn.send({ type: "input_ack", seq: me.lastSeq, serverTime: Date.now() });
+      return;
+    }
+
+    if (input.type === "host_state_begin" || input.type === "host_state_chunk" || input.type === "host_state_end") {
+      if (me.slot !== 1 || lobby.hostConnectionId !== conn.id) { conn.send({ type: "protocol_error", code: "HOST_ONLY" }); return; }
+      if (input.type === "host_state_begin") {
+        const totalBytes = Number(input.totalBytes);
+        const totalChunks = Number(input.totalChunks);
+        const syncId = String(input.syncId || "").slice(0, 80);
+        if (!syncId || !Number.isSafeInteger(totalBytes) || totalBytes < 1 || totalBytes > 4 * 1024 * 1024 || !Number.isSafeInteger(totalChunks) || totalChunks < 1 || totalChunks > 180) { conn.send({ type: "state_sync_rejected", code: "BAD_STATE_HEADER" }); return; }
+        lobby.stateSync = { syncId, totalBytes, totalChunks, chunks: new Array(totalChunks), received: 0, stateTick: Number(input.stateTick) || 0, romKey: lobby.romKey, patchProfile: lobby.patchProfile };
+        for (const member of lobby.members.values()) if (member.conn.id !== conn.id) member.conn.send({ type: "host_state_begin", syncId, totalBytes, totalChunks, stateTick: lobby.stateSync.stateTick, romKey: lobby.romKey, patchProfile: lobby.patchProfile });
+        return;
+      }
+      if (!lobby.stateSync || String(input.syncId) !== lobby.stateSync.syncId) { conn.send({ type: "state_sync_rejected", code: "UNKNOWN_STATE_SYNC" }); return; }
+      if (input.type === "host_state_chunk") {
+        const index = Number(input.index);
+        const data = String(input.data || "");
+        if (!Number.isSafeInteger(index) || index < 0 || index >= lobby.stateSync.totalChunks || data.length > 44000) { conn.send({ type: "state_sync_rejected", code: "BAD_STATE_CHUNK" }); return; }
+        if (!lobby.stateSync.chunks[index]) { lobby.stateSync.chunks[index] = data; lobby.stateSync.received += 1; }
+        for (const member of lobby.members.values()) if (member.conn.id !== conn.id) member.conn.send({ type: "host_state_chunk", syncId: lobby.stateSync.syncId, index, data });
+        return;
+      }
+      if (lobby.stateSync.received !== lobby.stateSync.totalChunks) { conn.send({ type: "state_sync_rejected", code: "STATE_INCOMPLETE", received: lobby.stateSync.received, expected: lobby.stateSync.totalChunks }); return; }
+      lobby.stateVersion += 1;
+      for (const member of lobby.members.values()) if (member.conn.id !== conn.id) member.conn.send({ type: "host_state_end", syncId: lobby.stateSync.syncId, stateVersion: lobby.stateVersion, stateTick: lobby.stateSync.stateTick, serverTime: Date.now() });
+      console.log(JSON.stringify({ event: "host_state_committed", lobbyId: lobby.id, stateVersion: lobby.stateVersion, bytes: lobby.stateSync.totalBytes }));
       return;
     }
 
@@ -192,15 +241,24 @@ export const room = {
         seq: member.lastSeq,
         input: member.latestInput ? { seq: member.latestInput.seq, buttons: member.latestInput.buttons, axisX: member.latestInput.axisX, axisY: member.latestInput.axisY } : null,
       }));
-      const snapshot = { type: "snapshot", lobbyId: lobby.id, tick: lobby.tick, serverTime, players };
+      const snapshot = { type: "snapshot", lobbyId: lobby.id, tick: lobby.tick, stateVersion: lobby.stateVersion || 0, serverTime, players };
       for (const member of lobby.members.values()) member.conn.send(snapshot);
     }
   },
 
   async onClose(conn, room, env) {
-    const lobby = conn.lobbyId ? activeLobbies.get(conn.lobbyId) : null;
+    const lobbyId = connectionLobbies.get(conn.id);
+    connectionLobbies.delete(conn.id);
+    const lobby = lobbyId ? activeLobbies.get(lobbyId) : null;
     if (!lobby) return;
     lobby.members.delete(conn.id);
+    if (lobby.hostConnectionId === conn.id && lobby.members.size) {
+      for (const member of lobby.members.values()) member.conn.close(4002, "Host left; create a new lobby");
+      await env.DB.prepare("UPDATE lobbies SET status = 'closed', last_seen_at = ? WHERE id = ?").bind(Date.now(), lobby.id).run();
+      activeLobbies.delete(lobby.id);
+      console.log(JSON.stringify({ event: "lobby_closed", lobbyId: lobby.id, reason: "host_left" }));
+      return;
+    }
     if (!lobby.members.size) {
       activeLobbies.delete(lobby.id);
       await env.DB.prepare("UPDATE lobbies SET status = 'closed', last_seen_at = ? WHERE id = ?").bind(Date.now(), lobby.id).run();
