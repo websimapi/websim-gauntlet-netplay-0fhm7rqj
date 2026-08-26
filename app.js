@@ -24,6 +24,7 @@ const state = {
   stateSyncInFlight: false,
   lastPlayerCount: 0,
   hostCheckpointTimer: null,
+  lastResyncRequestAt: 0,
 };
 
 const $ = (id) => document.getElementById(id);
@@ -205,7 +206,7 @@ function buildReport() {
     rom: state.romMeta ? { ...state.romMeta } : null,
     connection: { lobby: state.lobby?.id || null, self: state.self, players: state.players.map(({ id, username, slot, seq }) => ({ id, username, slot, seq })), lastAck: state.lastAck },
     emulator: { started: state.emulatorStarted, ready: state.emulatorReady, EJS: Boolean(window.EJS_emulator), gameManager: Boolean(window.EJS_emulator?.gameManager), simulateInput: typeof window.EJS_emulator?.gameManager?.simulateInput === "function", globalSimulateInput: typeof window.simulate_input === "function", inputHook: Boolean(getInputHook()), getState: typeof window.EJS_emulator?.gameManager?.getState === "function", loadState: typeof window.EJS_emulator?.gameManager?.loadState === "function", compressionStream: typeof CompressionStream === "function", decompressionStream: typeof DecompressionStream === "function", crossOriginIsolated: Boolean(window.crossOriginIsolated), threads: Boolean(window.EJS_threads), volume: window.EJS_volume ?? null },
-    stateSync: { incoming: state.incomingStateSync ? { syncId: state.incomingStateSync.syncId, received: state.incomingStateSync.received, totalChunks: state.incomingStateSync.totalChunks, bytes: state.incomingStateSync.totalBytes, rawBytes: state.incomingStateSync.rawBytes, encoding: state.incomingStateSync.encoding } : null, pending: Boolean(state.pendingHostState), sending: state.stateSyncInFlight },
+    stateSync: { incoming: state.incomingStateSync ? { syncId: state.incomingStateSync.syncId, received: state.incomingStateSync.received, totalChunks: state.incomingStateSync.totalChunks, bytes: state.incomingStateSync.totalBytes, rawBytes: state.incomingStateSync.rawBytes, encoding: state.incomingStateSync.encoding, chunkEncoding: state.incomingStateSync.chunkEncoding } : null, pending: Boolean(state.pendingHostState), sending: state.stateSyncInFlight },
     protocol: { name: "input-authority/0.1", inputSequence: state.seq, currentInput: state.input },
     recentLogs: state.logs.slice(-80),
   }, null, 2);
@@ -349,8 +350,8 @@ function handleRoomMessage(raw) {
   if (message.type === "host_state_begin") {
     if (!state.lobby || message.lobbyId !== state.lobby.id) return;
     if (message.romKey !== state.romMeta?.romKey) { log("host_state_rom_mismatch", { expected: state.romMeta?.romKey, received: message.romKey }, "ERROR"); return; }
-    state.incomingStateSync = { syncId: message.syncId, totalBytes: message.totalBytes, rawBytes: message.rawBytes, totalChunks: message.totalChunks, encoding: message.encoding || "identity", stateTick: message.stateTick, chunks: new Array(message.totalChunks), received: 0 };
-    log("host_state_begin", { syncId: message.syncId, bytes: message.totalBytes, rawBytes: message.rawBytes, totalChunks: message.totalChunks, encoding: state.incomingStateSync.encoding, stateTick: message.stateTick });
+    state.incomingStateSync = { syncId: message.syncId, totalBytes: message.totalBytes, rawBytes: message.rawBytes, totalChunks: message.totalChunks, encoding: message.encoding || "identity", chunkEncoding: message.chunkEncoding || "base64url", stateTick: message.stateTick, chunks: new Array(message.totalChunks), received: 0 };
+    log("host_state_begin", { syncId: message.syncId, bytes: message.totalBytes, rawBytes: message.rawBytes, totalChunks: message.totalChunks, encoding: state.incomingStateSync.encoding, chunkEncoding: state.incomingStateSync.chunkEncoding, stateTick: message.stateTick });
     return;
   }
   if (message.type === "host_state_chunk") {
@@ -365,29 +366,41 @@ function handleRoomMessage(raw) {
   if (message.type === "host_state_end") {
     if (!state.lobby || message.lobbyId !== state.lobby.id) return;
     const sync = state.incomingStateSync;
-    if (!sync || sync.syncId !== message.syncId || sync.received !== sync.totalChunks) { log("host_state_incomplete", { syncId: message.syncId, received: sync?.received || 0, expected: sync?.totalChunks || 0 }, "ERROR"); return; }
+    if (!sync || sync.syncId !== message.syncId || sync.received !== sync.totalChunks) {
+      log("host_state_incomplete", { syncId: message.syncId, received: sync?.received || 0, expected: sync?.totalChunks || 0 }, "ERROR");
+      requestHostStateResync(message.syncId, "incomplete");
+      return;
+    }
     const packedBytes = new Uint8Array(sync.totalBytes);
     let offset = 0;
     try {
       for (let index = 0; index < sync.chunks.length; index += 1) {
         const chunk = sync.chunks[index];
         let decoded;
-        try { decoded = bytesFromBase64(chunk); }
-        catch (error) { throw new Error(`state chunk ${index} is invalid base64: ${error.message}`); }
+        try { decoded = bytesFromTransport(chunk, sync.chunkEncoding); }
+        catch (error) { throw new Error(`state chunk ${index} has an invalid ${sync.chunkEncoding} payload: ${error.message}`); }
         if (offset + decoded.length > packedBytes.byteLength) throw new Error("state chunks exceed declared size");
         packedBytes.set(decoded, offset);
         offset += decoded.length;
       }
       if (offset !== packedBytes.byteLength) throw new Error(`state chunks are ${offset} bytes; expected ${packedBytes.byteLength}`);
     }
-    catch (error) { log("host_state_decode_error", { syncId: sync.syncId, message: error.message }, "ERROR"); return; }
+    catch (error) {
+      state.incomingStateSync = null;
+      log("host_state_decode_error", { syncId: sync.syncId, message: error.message }, "ERROR");
+      requestHostStateResync(sync.syncId, "chunk_decode");
+      return;
+    }
     state.incomingStateSync = null;
     decompressState(packedBytes, sync.encoding).then((bytes) => {
       if (sync.rawBytes && bytes.byteLength !== sync.rawBytes) throw new Error(`decoded state is ${bytes.byteLength} bytes; expected ${sync.rawBytes}`);
       state.pendingHostState = { bytes, stateTick: message.stateTick, stateVersion: message.stateVersion, attempts: 0 };
-      log("host_state_received", { syncId: message.syncId, bytes: packedBytes.byteLength, rawBytes: bytes.byteLength, encoding: sync.encoding, stateTick: message.stateTick, stateVersion: message.stateVersion });
+      log("host_state_received", { syncId: message.syncId, bytes: packedBytes.byteLength, rawBytes: bytes.byteLength, encoding: sync.encoding, chunkEncoding: sync.chunkEncoding, stateTick: message.stateTick, stateVersion: message.stateVersion });
       return applyPendingHostState();
-    }).catch((error) => log("host_state_decode_error", { syncId: sync.syncId, encoding: sync.encoding, message: error.message }, "ERROR"));
+    }).catch((error) => {
+      log("host_state_decode_error", { syncId: sync.syncId, encoding: sync.encoding, message: error.message }, "ERROR");
+      requestHostStateResync(sync.syncId, "state_decode");
+    });
     return;
   }
   if (message.type === "snapshot") {
@@ -400,6 +413,15 @@ function handleRoomMessage(raw) {
     applyRemoteInputs(state.players);
     if (message.tick % 20 === 0) log("authoritative_snapshot", { lobbyId: message.lobbyId, tick: message.tick, players: state.players.length, serverTime: message.serverTime });
   }
+}
+
+function requestHostStateResync(syncId, reason) {
+  if (state.self?.slot === 1 || !state.room || !state.lobby) return;
+  const now = Date.now();
+  if (now - state.lastResyncRequestAt < 2000) return;
+  state.lastResyncRequestAt = now;
+  state.room.send({ type: "request_host_state", syncId });
+  log("host_state_resync_requested", { syncId, reason });
 }
 
 function applyRemoteInputs(players) {
@@ -450,14 +472,20 @@ async function waitForEmulatorCapabilities() {
   applyPendingHostState();
 }
 
-function base64FromBytes(bytes) {
-  let binary = "";
-  const chunkSize = 0x8000;
-  for (let index = 0; index < bytes.length; index += chunkSize) binary += String.fromCharCode(...bytes.subarray(index, index + chunkSize));
-  return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
+function hexFromBytes(bytes) {
+  let output = "";
+  for (const byte of bytes) output += byte.toString(16).padStart(2, "0");
+  return output;
 }
 
-function bytesFromBase64(value) {
+function bytesFromTransport(value, encoding = "base64url") {
+  if (encoding === "hex") {
+    const normalized = String(value || "").trim().replace(/\s+/g, "");
+    if (!normalized || normalized.length % 2 !== 0 || !/^[0-9a-f]+$/i.test(normalized)) throw new Error(`malformed hex payload (${normalized.length} chars)`);
+    const bytes = new Uint8Array(normalized.length / 2);
+    for (let index = 0; index < bytes.length; index += 1) bytes[index] = parseInt(normalized.slice(index * 2, index * 2 + 2), 16);
+    return bytes;
+  }
   const normalized = String(value || "").trim().replace(/\s+/g, "").replace(/-/g, "+").replace(/_/g, "/");
   if (!normalized || !/^[A-Za-z0-9+/]*={0,2}$/.test(normalized) || normalized.length % 4 === 1) throw new Error(`malformed payload (${normalized.length} chars)`);
   const padded = normalized + "=".repeat((4 - (normalized.length % 4)) % 4);
@@ -504,13 +532,13 @@ async function sendHostCheckpoint(reason = "periodic") {
     const totalChunks = Math.ceil(packed.bytes.byteLength / chunkSize);
     if (totalChunks > 900) throw new Error(`Compressed savestate needs ${totalChunks} chunks; room limit is 900`);
     const syncId = `${Date.now()}-${Math.random().toString(16).slice(2)}`;
-    state.room.send({ type: "host_state_begin", syncId, totalBytes: packed.bytes.byteLength, rawBytes: bytes.byteLength, totalChunks, encoding: packed.encoding, stateTick: state.lastServerTick || 0 });
+    state.room.send({ type: "host_state_begin", syncId, totalBytes: packed.bytes.byteLength, rawBytes: bytes.byteLength, totalChunks, encoding: packed.encoding, chunkEncoding: "hex", stateTick: state.lastServerTick || 0 });
     for (let index = 0; index < totalChunks; index += 1) {
-      state.room.send({ type: "host_state_chunk", syncId, index, data: base64FromBytes(packed.bytes.subarray(index * chunkSize, Math.min(packed.bytes.byteLength, (index + 1) * chunkSize))) });
+      state.room.send({ type: "host_state_chunk", syncId, index, data: hexFromBytes(packed.bytes.subarray(index * chunkSize, Math.min(packed.bytes.byteLength, (index + 1) * chunkSize))) });
       await new Promise((resolve) => window.setTimeout(resolve, 10));
     }
     state.room.send({ type: "host_state_end", syncId, stateTick: state.lastServerTick || 0 });
-    log("host_state_sent", { reason, syncId, bytes: packed.bytes.byteLength, rawBytes: bytes.byteLength, compression: `${Math.round((packed.bytes.byteLength / bytes.byteLength) * 100)}%`, encoding: packed.encoding, totalChunks });
+    log("host_state_sent", { reason, syncId, bytes: packed.bytes.byteLength, rawBytes: bytes.byteLength, compression: `${Math.round((packed.bytes.byteLength / bytes.byteLength) * 100)}%`, encoding: packed.encoding, chunkEncoding: "hex", totalChunks });
   } catch (error) {
     const message = error?.message || String(error);
     log("host_state_error", { reason, message }, "ERROR");
@@ -557,7 +585,13 @@ function sendInput(force = false) {
   if (signature !== state.lastLoggedInput || state.seq % 20 === 0) { state.lastLoggedInput = signature; log("input_sent", { seq: state.seq, buttons }); }
 }
 
-function setKey(key, pressed) { if (!(key in state.input) || state.input[key] === pressed) return; state.input[key] = pressed; applyLocalInput(); sendInput(true); }
+function setKey(key, pressed) {
+  if (!(key in state.input) || state.input[key] === pressed) return;
+  state.input[key] = pressed;
+  applyLocalInput();
+  sendInput(true);
+  if (pressed && state.self?.slot === 1 && ["start", "a", "b", "z"].includes(key)) scheduleHostCheckpoint("host_action");
+}
 
 function setupKeyboard() {
   const keys = { w: "up", arrowup: "up", s: "down", arrowdown: "down", a: "left", arrowleft: "left", d: "right", arrowright: "right", t: "dUp", g: "dDown", f: "dLeft", h: "dRight", j: "a", " ": "a", x: "a", k: "b", shift: "b", q: "z", z: "z", enter: "start", e: "l", r: "r", u: "cUp", i: "cRight", o: "cDown", p: "cLeft" };
