@@ -95,6 +95,11 @@ function sanitizeInput(raw, lastSeq) {
   return { seq, buttons, axisX: clampAxis(raw.axisX), axisY: clampAxis(raw.axisY), receivedAt: Date.now() };
 }
 
+function validStateChunk(value) {
+  const data = String(value || "").replace(/\s+/g, "");
+  return data.length > 0 && data.length % 4 !== 1 && /^[A-Za-z0-9+/_-]*={0,2}$/.test(data);
+}
+
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
@@ -246,7 +251,7 @@ export const room = {
       if (input.type === "host_state_chunk") {
         const index = Number(input.index);
         const data = String(input.data || "");
-        if (!Number.isSafeInteger(index) || index < 0 || index >= lobby.stateSync.totalChunks || data.length > 44000) { conn.send({ type: "state_sync_rejected", code: "BAD_STATE_CHUNK" }); return; }
+        if (!Number.isSafeInteger(index) || index < 0 || index >= lobby.stateSync.totalChunks || data.length > 44000 || !validStateChunk(data)) { conn.send({ type: "state_sync_rejected", code: "BAD_STATE_CHUNK", index }); return; }
         if (!lobby.stateSync.chunks[index]) { lobby.stateSync.chunks[index] = data; lobby.stateSync.received += 1; }
         room.broadcast({ type: "host_state_chunk", lobbyId: lobby.id, syncId: lobby.stateSync.syncId, index, data }, { except: [conn.id] });
         return;

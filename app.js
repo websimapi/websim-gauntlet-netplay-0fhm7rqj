@@ -369,8 +369,11 @@ function handleRoomMessage(raw) {
     const packedBytes = new Uint8Array(sync.totalBytes);
     let offset = 0;
     try {
-      for (const chunk of sync.chunks) {
-        const decoded = bytesFromBase64(chunk);
+      for (let index = 0; index < sync.chunks.length; index += 1) {
+        const chunk = sync.chunks[index];
+        let decoded;
+        try { decoded = bytesFromBase64(chunk); }
+        catch (error) { throw new Error(`state chunk ${index} is invalid base64: ${error.message}`); }
         if (offset + decoded.length > packedBytes.byteLength) throw new Error("state chunks exceed declared size");
         packedBytes.set(decoded, offset);
         offset += decoded.length;
@@ -451,11 +454,14 @@ function base64FromBytes(bytes) {
   let binary = "";
   const chunkSize = 0x8000;
   for (let index = 0; index < bytes.length; index += chunkSize) binary += String.fromCharCode(...bytes.subarray(index, index + chunkSize));
-  return btoa(binary);
+  return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
 }
 
 function bytesFromBase64(value) {
-  const binary = atob(value);
+  const normalized = String(value || "").trim().replace(/\s+/g, "").replace(/-/g, "+").replace(/_/g, "/");
+  if (!normalized || !/^[A-Za-z0-9+/]*={0,2}$/.test(normalized) || normalized.length % 4 === 1) throw new Error(`malformed payload (${normalized.length} chars)`);
+  const padded = normalized + "=".repeat((4 - (normalized.length % 4)) % 4);
+  const binary = atob(padded);
   const bytes = new Uint8Array(binary.length);
   for (let index = 0; index < binary.length; index += 1) bytes[index] = binary.charCodeAt(index);
   return bytes;
