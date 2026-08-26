@@ -2,6 +2,7 @@
 // renderer and is the better general-compatibility path for this game.
 const EMULATOR_CORE = "mupen64plus_next";
 const INPUT_HEARTBEAT_MS = 33;
+const ANALOG_MAX = 0x7fff;
 const STREAM_CONFIG = { iceServers: [{ urls: "stun:stun.l.google.com:19302" }] };
 
 const state = {
@@ -28,6 +29,7 @@ const state = {
   hostReadySignalSent: false,
   hostStream: null,
   hostStreamPeers: new Map(),
+  hostStreamOfferPromises: new Map(),
   remoteStreamConnection: null,
   remoteStreamCandidates: [],
   hostStreamRequestTimer: null,
@@ -350,6 +352,7 @@ function closeAllStreams() {
   if (state.hostStreamRequestTimer) window.clearTimeout(state.hostStreamRequestTimer);
   state.hostStreamRequestTimer = null;
   for (const peerId of state.hostStreamPeers.keys()) closeHostStreamPeer(peerId);
+  state.hostStreamOfferPromises.clear();
   if (state.hostStream) state.hostStream.getTracks().forEach((track) => track.stop());
   state.hostStream = null;
   closeRemoteStream();
@@ -391,6 +394,8 @@ async function ensureHostStreams() {
 }
 
 async function startHostStreamForPeer(peer, force = false) {
+  const pending = state.hostStreamOfferPromises.get(peer.id);
+  if (pending) return pending;
   const existing = state.hostStreamPeers.get(peer.id);
   if (existing && !force && !["failed", "closed"].includes(existing.connectionState)) return;
   if (existing) closeHostStreamPeer(peer.id);
@@ -408,14 +413,22 @@ async function startHostStreamForPeer(peer, force = false) {
       scheduleHostStreams(1000);
     }
   };
-  try {
-    const offer = await connection.createOffer();
-    await connection.setLocalDescription(offer);
-    streamSignal(peer.id, { kind: "description", description: { type: connection.localDescription.type, sdp: connection.localDescription.sdp } });
-    log("host_stream_offer_sent", { peerId: peer.id, slot: peer.slot });
-  } catch (error) {
-    log("host_stream_offer_error", { peerId: peer.id, message: error.message }, "ERROR");
-    closeHostStreamPeer(peer.id);
+  const offerPromise = (async () => {
+    try {
+      const offer = await connection.createOffer();
+      await connection.setLocalDescription(offer);
+      if (state.hostStreamPeers.get(peer.id) !== connection) { connection.close(); return; }
+      connection.offerSentAt = Date.now();
+      streamSignal(peer.id, { kind: "description", description: { type: connection.localDescription.type, sdp: connection.localDescription.sdp } });
+      log("host_stream_offer_sent", { peerId: peer.id, slot: peer.slot });
+    } catch (error) {
+      log("host_stream_offer_error", { peerId: peer.id, message: error.message }, "ERROR");
+      closeHostStreamPeer(peer.id);
+    }
+  })();
+  state.hostStreamOfferPromises.set(peer.id, offerPromise);
+  try { await offerPromise; } finally {
+    if (state.hostStreamOfferPromises.get(peer.id) === offerPromise) state.hostStreamOfferPromises.delete(peer.id);
   }
 }
 
@@ -434,7 +447,9 @@ async function handleStreamRequest(message) {
     return;
   }
   await ensureHostStreams();
-  if (state.hostStream) await startHostStreamForPeer(peer, true);
+  const existing = state.hostStreamPeers.get(peer.id);
+  const retry = !existing || ["failed", "closed"].includes(existing.connectionState) || Date.now() - Number(existing.offerSentAt || 0) > 5000;
+  if (state.hostStream) await startHostStreamForPeer(peer, retry);
 }
 
 function showRemoteStream(stream) {
@@ -571,11 +586,31 @@ function handleRoomMessage(raw) {
   }
 }
 
+function analogAxes(input) {
+  const axisX = input?.right && !input?.left ? ANALOG_MAX : input?.left && !input?.right ? -ANALOG_MAX : 0;
+  const axisY = input?.down && !input?.up ? ANALOG_MAX : input?.up && !input?.down ? -ANALOG_MAX : 0;
+  return { axisX, axisY };
+}
+
+function applyAnalogInput(port, axisX, axisY) {
+  const hook = getInputHook();
+  if (!hook) return;
+  const x = Math.max(-ANALOG_MAX, Math.min(ANALOG_MAX, Number(axisX) || 0));
+  const y = Math.max(-ANALOG_MAX, Math.min(ANALOG_MAX, Number(axisY) || 0));
+  // EmulatorJS maps the N64 left stick to four signed half-axis inputs:
+  // 16=X+, 17=X-, 18=Y+, 19=Y-. Values are signed 16-bit magnitudes.
+  hook(port, 16, x > 0 ? x : 0);
+  hook(port, 17, x < 0 ? -x : 0);
+  hook(port, 18, y > 0 ? y : 0);
+  hook(port, 19, y < 0 ? -y : 0);
+}
+
 function applyRemoteInputs(players) {
   const hook = getInputHook();
   if (!hook) return;
   for (const player of players) {
     if (player.id === state.self?.id || !player.input) continue;
+    applyAnalogInput(Math.max(0, player.slot - 1), player.input.axisX, player.input.axisY);
     for (const [key, value] of Object.entries(player.input.buttons || {})) {
       if (!(key in controllerButtonMap)) continue;
       try { hook(Math.max(0, player.slot - 1), controllerButtonMap[key], value ? 1 : 0); } catch (error) { log("remote_input_hook_error", { player: player.slot, key, message: error.message }, "WARN"); }
@@ -583,11 +618,13 @@ function applyRemoteInputs(players) {
   }
 }
 
-const controllerButtonMap = { a: 0, b: 8, z: 12, start: 3, l: 10, r: 11, dUp: 4, dDown: 5, dLeft: 6, dRight: 7, up: 19, down: 18, left: 17, right: 16, cUp: 23, cDown: 22, cLeft: 21, cRight: 20 };
+const controllerButtonMap = { a: 0, b: 8, z: 12, start: 3, l: 10, r: 11, dUp: 4, dDown: 5, dLeft: 6, dRight: 7, cUp: 23, cDown: 22, cLeft: 21, cRight: 20 };
 
 function applyLocalInput() {
   const hook = getInputHook();
   if (!hook || !state.self) return;
+  const axes = analogAxes(state.input);
+  applyAnalogInput(Math.max(0, state.self.slot - 1), axes.axisX, axes.axisY);
   for (const [key, value] of Object.entries(state.input)) {
     if (!(key in controllerButtonMap)) continue;
     try { hook(Math.max(0, state.self.slot - 1), controllerButtonMap[key], value ? 1 : 0); } catch (error) { log("local_input_hook_error", { player: state.self.slot, key, message: error.message }, "WARN"); }
@@ -625,7 +662,8 @@ function sendInput(force = false) {
   if (!force && signature === state.lastSentInput) return;
   state.lastSentInput = signature;
   state.seq += 1;
-  state.room.send({ type: "input", seq: state.seq, buttons: state.input, axisX: 0, axisY: 0 });
+  const axes = analogAxes(state.input);
+  state.room.send({ type: "input", seq: state.seq, buttons: state.input, axisX: axes.axisX, axisY: axes.axisY });
   const buttons = Object.entries(state.input).filter(([, value]) => value).map(([key]) => key);
   if (signature !== state.lastLoggedInput || state.seq % 20 === 0) { state.lastLoggedInput = signature; log("input_sent", { seq: state.seq, buttons }); }
 }

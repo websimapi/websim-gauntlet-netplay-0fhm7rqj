@@ -1,5 +1,6 @@
 const MAX_PLAYERS = 4;
 const MAX_STREAM_SIGNAL_CHARS = 48000;
+const MAX_AXIS_VALUE = 0x7fff;
 const INPUT_KEYS = ["up", "down", "left", "right", "dUp", "dDown", "dLeft", "dRight", "a", "b", "z", "start", "l", "r", "cUp", "cDown", "cLeft", "cRight"];
 const activeLobbies = new Map();
 const connectionLobbies = new Map();
@@ -82,7 +83,7 @@ function sanitizeInput(raw, lastSeq) {
   if (!Number.isSafeInteger(seq) || seq < 0 || seq <= lastSeq || seq > lastSeq + 120) return null;
   const buttons = {};
   for (const key of INPUT_KEYS) buttons[key] = raw.buttons && raw.buttons[key] === true;
-  const clampAxis = (value) => Math.max(-80, Math.min(80, Number.isFinite(Number(value)) ? Number(value) : 0));
+  const clampAxis = (value) => Math.max(-MAX_AXIS_VALUE, Math.min(MAX_AXIS_VALUE, Number.isFinite(Number(value)) ? Number(value) : 0));
   return { seq, buttons, axisX: clampAxis(raw.axisX), axisY: clampAxis(raw.axisY), receivedAt: Date.now() };
 }
 
