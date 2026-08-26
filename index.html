@@ -1,0 +1,101 @@
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+
+    <meta charset="utf-8" />
+    <link rel="canonical" href="https://websim.com/@api/gauntlet-netplay" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+
+    <title>Untitled</title>
+
+    <style>
+      html {
+        font-size: 15px;
+      }
+      html,
+      body {
+        margin: 0;
+        padding: 0;
+        min-height: 100%;
+        height: 100%;
+        display: flex;
+        flex-direction: column;
+      }
+      .warning {
+        background: black;
+        box-shadow: 0 2px 5px rgba(0, 0, 0, 0.5);
+        padding: 0.75em;
+        color: white;
+        text-align: center;
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI (Custom)",
+          Roboto, "Helvetica Neue", "Open Sans (Custom)", system-ui, sans-serif,
+          "Apple Color Emoji", "Segoe UI Emoji";
+        line-height: 1.2;
+        font-size: 1rem;
+        position: relative;
+        z-index: 2;
+      }
+      .warning span {
+        font-family: initial;
+      }
+      .warning h1 {
+        font-size: 1.2rem;
+        margin: 0;
+      }
+      .warning a {
+        color: rgb(66 133 244);
+      }
+      .iframe-wrap {
+        -webkit-box-flex: 1;
+        -webkit-flex: 1 1 auto;
+            -ms-flex: 1 1 auto;
+                flex: 1 1 auto;
+        height: 100%;
+        position: relative;
+        overflow: auto;
+        -webkit-overflow-scrolling: touch;
+      }
+      .iframe {
+        position: absolute;
+        top: 0;
+        left: 0;
+        border: 0;
+        display: block;
+        width: 100%;
+        height: 100%;
+      }
+      @media (max-width: 550px) {
+        @supports (height: 100svh) {
+          .iframe {
+            height: calc(100svh - var(--cp-header-height-small));
+          }
+        }
+      }
+    </style>
+  </head>
+
+  <body class="">
+    <div class="warning">
+      <h1>
+        <span>⚠️</span> Do not enter passwords or personal information on this
+        page. <span>⚠️</span>
+      </h1>
+      This a creation by a user on
+      <a href="https://websim.com/p/ok6ag08qd3sq0fhm7rqj/2">Websim</a>.
+      <br />
+      A referer from Websim is required to render this page view, and your
+      browser is not sending one.
+      <br />
+    </div>
+
+    <div class="result-iframe-wrap" role="main">
+      <iframe
+        name="contentWindow"
+        allow="accelerometer *; autoplay *; bluetooth *; camera *; encrypted-media *; display-capture *; geolocation *; gyroscope *; microphone *; midi *; clipboard-read *; clipboard-write *; serial *; xr-spatial-tracking *; fullscreen *; payment *"
+        class="iframe"
+        src="https://ok6ag08qd3sq0fhm7rqj.c.websim.com/index.html?v=2"
+      ></iframe>
+    </div>
+    
+  </body>
+</html>
