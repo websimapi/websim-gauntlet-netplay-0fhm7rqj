@@ -1,3 +1,8 @@
+// EmulatorJS uses the libretro core identifier in its CDN filenames. The
+// public N64 docs call this core "parallel-n64", but stable/data/cores uses
+// "parallel_n64" (for example, parallel_n64-wasm.data).
+const EMULATOR_CORE = "parallel_n64";
+
 const state = {
   user: null,
   selectedVisibility: "public",
@@ -216,7 +221,7 @@ function buildReport() {
     viewport: `${window.innerWidth}x${window.innerHeight}`,
     rom: state.romMeta ? { ...state.romMeta } : null,
     connection: { lobby: state.lobby?.id || null, self: state.self, players: state.players.map(({ id, username, slot, seq }) => ({ id, username, slot, seq })), lastAck: state.lastAck },
-    emulator: { started: state.emulatorStarted, ready: state.emulatorReady, EJS: Boolean(window.EJS_emulator), gameManager: Boolean(window.EJS_emulator?.gameManager), simulateInput: typeof window.EJS_emulator?.gameManager?.simulateInput === "function", globalSimulateInput: typeof window.simulate_input === "function", inputHook: Boolean(getInputHook()), getState: typeof window.EJS_emulator?.gameManager?.getState === "function", loadState: typeof window.EJS_emulator?.gameManager?.loadState === "function", compressionStream: typeof CompressionStream === "function", decompressionStream: typeof DecompressionStream === "function", crossOriginIsolated: Boolean(window.crossOriginIsolated), threads: Boolean(window.EJS_threads), volume: window.EJS_volume ?? null },
+    emulator: { core: EMULATOR_CORE, started: state.emulatorStarted, ready: state.emulatorReady, EJS: Boolean(window.EJS_emulator), gameManager: Boolean(window.EJS_emulator?.gameManager), simulateInput: typeof window.EJS_emulator?.gameManager?.simulateInput === "function", globalSimulateInput: typeof window.simulate_input === "function", inputHook: Boolean(getInputHook()), getState: typeof window.EJS_emulator?.gameManager?.getState === "function", loadState: typeof window.EJS_emulator?.gameManager?.loadState === "function", compressionStream: typeof CompressionStream === "function", decompressionStream: typeof DecompressionStream === "function", crossOriginIsolated: Boolean(window.crossOriginIsolated), threads: Boolean(window.EJS_threads), volume: window.EJS_volume ?? null },
     stateSync: { incoming: state.incomingStateSync ? { syncId: state.incomingStateSync.syncId, received: state.incomingStateSync.received, totalChunks: state.incomingStateSync.totalChunks, bytes: state.incomingStateSync.totalBytes, rawBytes: state.incomingStateSync.rawBytes, encoding: state.incomingStateSync.encoding, chunkEncoding: state.incomingStateSync.chunkEncoding, stateVersion: state.incomingStateSync.stateVersion, barrierId: state.incomingStateSync.barrierId } : null, pending: state.pendingHostState ? { syncId: state.pendingHostState.syncId, stateVersion: state.pendingHostState.stateVersion, barrierId: state.pendingHostState.barrierId } : null, sending: state.stateSyncInFlight, hostAwaitingPeerSync: state.hostAwaitingPeerSync, hostBarrierPaused: state.hostBarrierPaused, hostSyncTargetVersion: state.hostSyncTargetVersion, peerSyncHold: state.peerSyncHold, peerSyncPaused: state.peerSyncPaused, peerSyncTargetVersion: state.peerSyncTargetVersion, lastAppliedStateVersion: state.lastAppliedStateVersion },
     protocol: { name: "input-authority/0.1", serverTickMs: 16, inputSendMs: 16, stateSyncPolicy: "join-barrier-only", inputSequence: state.seq, currentInput: state.input },
     recentLogs: state.logs.slice(-80),
@@ -778,9 +783,9 @@ async function launchEmulator(reason = "manual") {
   $("bridgeCoreState").className = "amber";
   $("bridgeBadge").textContent = "BOOTING";
   $("emulatorStatus").textContent = "Loading Parallel N64 core…";
-  log("emulator_boot_requested", { reason, core: "parallel-n64", dataPath: "https://cdn.emulatorjs.org/stable/data/", rom: state.rom.name });
+  log("emulator_boot_requested", { reason, core: EMULATOR_CORE, dataPath: "https://cdn.emulatorjs.org/stable/data/", rom: state.rom.name });
   window.EJS_player = "#game";
-  window.EJS_core = "parallel-n64";
+  window.EJS_core = EMULATOR_CORE;
   window.EJS_gameUrl = state.romUrl;
   window.EJS_gameName = state.rom.name;
   window.EJS_biosUrl = "";
@@ -793,7 +798,7 @@ async function launchEmulator(reason = "manual") {
   window.EJS_startOnLoaded = true;
   window.EJS_DEBUG_XX = true;
   window.EJS_controlScheme = "n64";
-  window.EJS_ready = () => { state.emulatorReady = true; $("bridgeCoreState").textContent = "READY"; $("bridgeCoreState").className = "ready"; $("bridgeBadge").textContent = "CORE READY"; $("bridgeBadge").classList.add("live"); $("emulatorStatus").textContent = "N64 core ready · local frame"; if (state.peerSyncHold && typeof window.EJS_emulator?.pause === "function") { try { window.EJS_emulator.pause(); state.peerSyncPaused = true; } catch (error) { log("peer_sync_hold_error", { message: error.message }, "WARN"); } } log("emulator_ready", { core: "parallel-n64", inputHook: Boolean(getInputHook()), getState: typeof window.EJS_emulator?.gameManager?.getState === "function", loadState: typeof window.EJS_emulator?.gameManager?.loadState === "function", threads: Boolean(window.EJS_threads), crossOriginIsolated: Boolean(window.crossOriginIsolated), vsync: window.EJS_defaultOptions?.vsync, volume: window.EJS_volume }); if (state.self?.slot === 1) { state.room?.send({ type: "host_emulator_ready", romKey: state.romMeta?.romKey, patchProfile: state.romMeta?.patchProfile }); } waitForEmulatorCapabilities(); };
+  window.EJS_ready = () => { state.emulatorReady = true; $("bridgeCoreState").textContent = "READY"; $("bridgeCoreState").className = "ready"; $("bridgeBadge").textContent = "CORE READY"; $("bridgeBadge").classList.add("live"); $("emulatorStatus").textContent = "N64 core ready · local frame"; if (state.peerSyncHold && typeof window.EJS_emulator?.pause === "function") { try { window.EJS_emulator.pause(); state.peerSyncPaused = true; } catch (error) { log("peer_sync_hold_error", { message: error.message }, "WARN"); } } log("emulator_ready", { core: EMULATOR_CORE, inputHook: Boolean(getInputHook()), getState: typeof window.EJS_emulator?.gameManager?.getState === "function", loadState: typeof window.EJS_emulator?.gameManager?.loadState === "function", threads: Boolean(window.EJS_threads), crossOriginIsolated: Boolean(window.crossOriginIsolated), vsync: window.EJS_defaultOptions?.vsync, volume: window.EJS_volume }); if (state.self?.slot === 1) { state.room?.send({ type: "host_emulator_ready", romKey: state.romMeta?.romKey, patchProfile: state.romMeta?.patchProfile }); } waitForEmulatorCapabilities(); };
   window.EJS_onExit = () => { state.emulatorStarted = false; state.emulatorReady = false; $("emulatorStatus").textContent = "Emulator exited"; log("emulator_exit"); };
   if (state.emulatorScript) state.emulatorScript.remove();
   const script = document.createElement("script");
