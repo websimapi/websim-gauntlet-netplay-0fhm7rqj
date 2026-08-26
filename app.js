@@ -1,9 +1,11 @@
 // Use EmulatorJS's default N64 core. Mupen64Plus-Next uses the GLideN64
 // renderer and is the better general-compatibility path for this game.
 const EMULATOR_CORE = "mupen64plus_next";
-// Keep WebSocket payloads comfortably below browser/proxy message-size
-// boundaries. 16,000 packed bytes become at most ~21,334 base64url chars.
-const STATE_CHUNK_BYTES = 16000;
+// WebsimSocket can carry large strings, but base64url payloads have been
+// observed arriving with invalid characters in a peer. Hex is less compact,
+// so use smaller chunks to keep the complete JSON message conservative.
+const STATE_CHUNK_BYTES = 8000;
+const STATE_CHUNK_ENCODING = "hex";
 
 const state = {
   user: null,
@@ -655,12 +657,6 @@ function scheduleHostCheckpoint(reason, delayMs = 150) {
   state.hostCheckpointTimer = window.setTimeout(() => sendHostCheckpoint(reason), delayMs);
 }
 
-function base64urlFromBytes(bytes) {
-  let binary = "";
-  for (const byte of bytes) binary += String.fromCharCode(byte);
-  return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
-}
-
 async function sendHostCheckpoint(reason = "periodic") {
   if (state.stateSyncInFlight) { state.hostCheckpointPending = reason; return; }
   if (!state.self || state.self.slot !== 1 || !state.lobby || !state.emulatorReady || state.players.length < 2) return;
@@ -675,17 +671,25 @@ async function sendHostCheckpoint(reason = "periodic") {
       catch (error) { throw new Error(`Unable to pause host emulator: ${error.message}`); }
     }
     let rawState;
-    for (let attempt = 1; attempt <= 6; attempt += 1) {
+    for (let attempt = 1; attempt <= 20; attempt += 1) {
       try {
-        rawState = gameManager.getState();
+        // Some EmulatorJS builds expose getState synchronously while others
+        // finish the save asynchronously. Await handles both forms and also
+        // prevents a Promise from being mistaken for the state byte array.
+        rawState = await gameManager.getState();
         break;
       } catch (error) {
-        if (attempt === 6) throw error;
-        log("host_state_capture_retry", { reason, attempt, delayMs: 120, message: error?.message || String(error) }, "WARN");
-        await new Promise((resolve) => window.setTimeout(resolve, 120));
+        if (attempt === 20) throw error;
+        const delayMs = 150;
+        if (attempt === 1 || attempt === 3 || attempt % 4 === 0) log("host_state_capture_retry", { reason, attempt, delayMs, message: error?.message || String(error) }, "WARN");
+        await new Promise((resolve) => window.setTimeout(resolve, delayMs));
       }
     }
-    const bytes = new Uint8Array(rawState instanceof Uint8Array ? rawState : new Uint8Array(rawState));
+    const bytes = rawState instanceof ArrayBuffer
+      ? new Uint8Array(rawState)
+      : ArrayBuffer.isView(rawState)
+        ? new Uint8Array(rawState.buffer, rawState.byteOffset, rawState.byteLength)
+        : new Uint8Array(rawState);
     if (!bytes.byteLength) throw new Error("Emulator returned an empty savestate");
     const packed = await compressState(bytes);
     if (packed.bytes.byteLength > 20 * 1024 * 1024) throw new Error(`Compressed savestate is ${packed.bytes.byteLength} bytes; room limit is 20 MB`);
@@ -693,15 +697,17 @@ async function sendHostCheckpoint(reason = "periodic") {
     const totalChunks = Math.ceil(packed.bytes.byteLength / chunkSize);
     if (totalChunks > 900) throw new Error(`Compressed savestate needs ${totalChunks} chunks; room limit is 900`);
     const syncId = `${Date.now()}-${Math.random().toString(16).slice(2)}`;
-    state.room.send({ type: "host_state_begin", syncId, totalBytes: packed.bytes.byteLength, rawBytes: bytes.byteLength, totalChunks, encoding: packed.encoding, chunkEncoding: "base64url", barrierId: state.hostSyncBarrierId, stateTick: state.lastServerTick || 0 });
+    state.room.send({ type: "host_state_begin", syncId, totalBytes: packed.bytes.byteLength, rawBytes: bytes.byteLength, totalChunks, encoding: packed.encoding, chunkEncoding: STATE_CHUNK_ENCODING, barrierId: state.hostSyncBarrierId, stateTick: state.lastServerTick || 0 });
     for (let index = 0; index < totalChunks; index += 1) {
-      state.room.send({ type: "host_state_chunk", syncId, index, data: base64urlFromBytes(packed.bytes.subarray(index * chunkSize, Math.min(packed.bytes.byteLength, (index + 1) * chunkSize))) });
-      await new Promise((resolve) => window.setTimeout(resolve, 1));
+      state.room.send({ type: "host_state_chunk", syncId, index, data: hexFromBytes(packed.bytes.subarray(index * chunkSize, Math.min(packed.bytes.byteLength, (index + 1) * chunkSize))) });
+      // Yield between sends so the room transport can enqueue each message
+      // independently instead of building one burst in the browser.
+      await new Promise((resolve) => window.setTimeout(resolve, 4));
     }
     state.room.send({ type: "host_state_end", syncId, stateTick: state.lastServerTick || 0 });
     checkpointSent = true;
     state.hostStateRetryCount = 0;
-    log("host_state_sent", { reason, syncId, bytes: packed.bytes.byteLength, rawBytes: bytes.byteLength, compression: `${Math.round((packed.bytes.byteLength / bytes.byteLength) * 100)}%`, encoding: packed.encoding, chunkEncoding: "base64url", totalChunks });
+    log("host_state_sent", { reason, syncId, bytes: packed.bytes.byteLength, rawBytes: bytes.byteLength, compression: `${Math.round((packed.bytes.byteLength / bytes.byteLength) * 100)}%`, encoding: packed.encoding, chunkEncoding: STATE_CHUNK_ENCODING, totalChunks });
   } catch (error) {
     const message = error?.message || String(error);
     log("host_state_error", { reason, message }, "ERROR");
