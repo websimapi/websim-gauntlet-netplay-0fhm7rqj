@@ -219,6 +219,12 @@ function renderPlayers() {
   }).join("");
 }
 
+function mergePlayers(existing, incoming) {
+  const merged = new Map((existing || []).map((player) => [player.id, player]));
+  for (const player of incoming || []) merged.set(player.id, { ...merged.get(player.id), ...player });
+  return [...merged.values()].sort((a, b) => a.slot - b.slot);
+}
+
 function escapeHtml(value) { return String(value).replace(/[&<>'"]/g, (char) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", "'": "&#39;", '"': "&quot;" }[char])); }
 
 function renderLobbyList(lobbies) {
@@ -286,7 +292,7 @@ function handleRoomMessage(raw) {
     const previousCount = state.players.length;
     state.lobby = message.lobby;
     state.self = message.self;
-    state.players = message.players || [];
+    state.players = mergePlayers([], message.players);
     $("partyStatus").classList.remove("hidden");
     $("activeLobbyCode").textContent = state.lobby.id;
     $("partyStatusLabel").textContent = `${state.lobby.visibility.toUpperCase()} LOBBY · P${state.self.slot}`;
@@ -294,12 +300,14 @@ function handleRoomMessage(raw) {
     log("lobby_joined", { lobbyId: state.lobby.id, slot: state.self.slot, playerCount: state.players.length });
     toast(`Joined ${state.lobby.id} as P${state.self.slot}`);
     if (state.self.slot === 1 && state.players.length > previousCount) scheduleHostCheckpoint("joiner_connected");
+    if (state.lobby.hostReady && state.self.slot !== 1 && !state.emulatorStarted) { log("host_boot_replay", { lobbyId: state.lobby.id, romKey: state.lobby.romKey }); launchEmulator("host_boot_replay"); }
     return;
   }
   if (message.type === "lobby_state") {
+    if (!state.lobby || message.lobby.id !== state.lobby.id) return;
     const previousCount = state.players.length;
     state.lobby = message.lobby;
-    state.players = message.players || [];
+    state.players = mergePlayers(state.players, message.players);
     renderPlayers();
     log("lobby_state", { lobbyId: message.lobby.id, playerCount: state.players.length, stateVersion: message.lobby.stateVersion || 0 });
     if (state.self?.slot === 1 && state.players.length > previousCount) scheduleHostCheckpoint("joiner_connected");
@@ -310,13 +318,29 @@ function handleRoomMessage(raw) {
   if (message.type === "input_rejected") { log("input_rejected", message, "WARN"); return; }
   if (message.type === "protocol_error") { log("protocol_error", message, "ERROR"); return; }
   if (message.type === "state_sync_rejected") { log("state_sync_rejected", message, "ERROR"); return; }
+  if (message.type === "host_emulator_ready") {
+    if (!state.lobby || message.lobbyId !== state.lobby.id || message.romKey !== state.romMeta?.romKey) return;
+    state.lobby.hostReady = true;
+    log("host_boot_signal", { lobbyId: message.lobbyId, stateVersion: message.stateVersion || 0 });
+    if (state.self?.slot !== 1 && !state.emulatorStarted) launchEmulator("host_boot_signal");
+    return;
+  }
+  if (message.type === "input_relay") {
+    if (!state.lobby || message.lobbyId !== state.lobby.id || !message.player) return;
+    state.players = mergePlayers(state.players, [message.player]);
+    renderPlayers();
+    applyRemoteInputs([message.player]);
+    return;
+  }
   if (message.type === "host_state_begin") {
+    if (!state.lobby || message.lobbyId !== state.lobby.id) return;
     if (message.romKey !== state.romMeta?.romKey) { log("host_state_rom_mismatch", { expected: state.romMeta?.romKey, received: message.romKey }, "ERROR"); return; }
     state.incomingStateSync = { syncId: message.syncId, totalBytes: message.totalBytes, totalChunks: message.totalChunks, stateTick: message.stateTick, chunks: new Array(message.totalChunks), received: 0 };
     log("host_state_begin", { syncId: message.syncId, totalBytes: message.totalBytes, totalChunks: message.totalChunks, stateTick: message.stateTick });
     return;
   }
   if (message.type === "host_state_chunk") {
+    if (!state.lobby || message.lobbyId !== state.lobby.id) return;
     const sync = state.incomingStateSync;
     if (!sync || sync.syncId !== message.syncId || sync.chunks[message.index]) return;
     sync.chunks[message.index] = message.data;
@@ -324,6 +348,7 @@ function handleRoomMessage(raw) {
     return;
   }
   if (message.type === "host_state_end") {
+    if (!state.lobby || message.lobbyId !== state.lobby.id) return;
     const sync = state.incomingStateSync;
     if (!sync || sync.syncId !== message.syncId || sync.received !== sync.totalChunks) { log("host_state_incomplete", { syncId: message.syncId, received: sync?.received || 0, expected: sync?.totalChunks || 0 }, "ERROR"); return; }
     const bytes = new Uint8Array(sync.totalBytes);
@@ -337,8 +362,9 @@ function handleRoomMessage(raw) {
     return;
   }
   if (message.type === "snapshot") {
+    if (!state.lobby || message.lobbyId !== state.lobby.id) return;
     state.lastServerTick = message.tick;
-    state.players = message.players || state.players;
+    state.players = mergePlayers(state.players, message.players);
     renderPlayers();
     const selfFrame = state.players.find((player) => player.id === state.self?.id);
     if (selfFrame) $("inputReadout").innerHTML = `P${selfFrame.slot} INPUT <span>SEQ ${selfFrame.seq}</span>`;
@@ -438,7 +464,7 @@ function setupKeyboard() {
   window.setInterval(() => { if (state.self) sendInput(true); }, 100);
 }
 
-async function launchEmulator() {
+async function launchEmulator(reason = "manual") {
   if (!state.rom) return;
   if (typeof window.EJS_terminate === "function") { try { window.EJS_terminate(); } catch {} }
   if (state.romUrl) URL.revokeObjectURL(state.romUrl);
@@ -451,17 +477,21 @@ async function launchEmulator() {
   $("bridgeCoreState").className = "amber";
   $("bridgeBadge").textContent = "BOOTING";
   $("emulatorStatus").textContent = "Loading Mupen64Plus Next core…";
-  log("emulator_boot_requested", { core: "mupen64plus_next", dataPath: "https://cdn.emulatorjs.org/stable/data/", rom: state.rom.name });
+  log("emulator_boot_requested", { reason, core: "mupen64plus_next", dataPath: "https://cdn.emulatorjs.org/stable/data/", rom: state.rom.name });
   window.EJS_player = "#game";
   window.EJS_core = "n64";
   window.EJS_gameUrl = state.romUrl;
   window.EJS_gameName = state.rom.name;
   window.EJS_biosUrl = "";
   window.EJS_pathtodata = "https://cdn.emulatorjs.org/stable/data/";
+  window.EJS_gameID = 64;
+  window.EJS_volume = 0.7;
+  window.EJS_threads = Boolean(window.crossOriginIsolated && window.SharedArrayBuffer);
+  window.EJS_defaultOptions = { ...(window.EJS_defaultOptions || {}), vsync: "disabled", shader: "disabled", webgl2Enabled: "enabled" };
   window.EJS_startOnLoaded = true;
   window.EJS_DEBUG_XX = true;
   window.EJS_controlScheme = "n64";
-  window.EJS_ready = () => { state.emulatorReady = true; $("bridgeCoreState").textContent = "READY"; $("bridgeCoreState").className = "ready"; $("bridgeBadge").textContent = "CORE READY"; $("bridgeBadge").classList.add("live"); $("emulatorStatus").textContent = "N64 core ready · local frame"; log("emulator_ready", { inputHook: Boolean(getInputHook()), getState: typeof window.EJS_emulator?.gameManager?.getState === "function", loadState: typeof window.EJS_emulator?.gameManager?.loadState === "function" }); applyPendingHostState(); if (state.self?.slot === 1 && state.players.length > 1) scheduleHostCheckpoint("emulator_ready"); };
+  window.EJS_ready = () => { state.emulatorReady = true; $("bridgeCoreState").textContent = "READY"; $("bridgeCoreState").className = "ready"; $("bridgeBadge").textContent = "CORE READY"; $("bridgeBadge").classList.add("live"); $("emulatorStatus").textContent = "N64 core ready · local frame"; log("emulator_ready", { inputHook: Boolean(getInputHook()), getState: typeof window.EJS_emulator?.gameManager?.getState === "function", loadState: typeof window.EJS_emulator?.gameManager?.loadState === "function", threads: Boolean(window.EJS_threads), volume: window.EJS_volume }); applyPendingHostState(); if (state.self?.slot === 1) { state.room?.send({ type: "host_emulator_ready", romKey: state.romMeta?.romKey, patchProfile: state.romMeta?.patchProfile }); if (state.players.length > 1) scheduleHostCheckpoint("emulator_ready"); } };
   window.EJS_onExit = () => { state.emulatorStarted = false; state.emulatorReady = false; $("emulatorStatus").textContent = "Emulator exited"; log("emulator_exit"); };
   if (state.emulatorScript) state.emulatorScript.remove();
   const script = document.createElement("script");
