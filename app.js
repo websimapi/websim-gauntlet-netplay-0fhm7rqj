@@ -1,7 +1,6 @@
-// EmulatorJS uses the libretro core identifier in its CDN filenames. The
-// public N64 docs call this core "parallel-n64", but stable/data/cores uses
-// "parallel_n64" (for example, parallel_n64-wasm.data).
-const EMULATOR_CORE = "parallel_n64";
+// Use EmulatorJS's default N64 core. Mupen64Plus-Next uses the GLideN64
+// renderer and is the better general-compatibility path for this game.
+const EMULATOR_CORE = "mupen64plus_next";
 // Keep WebSocket payloads comfortably below browser/proxy message-size
 // boundaries. 16,000 packed bytes become at most ~21,334 base64url chars.
 const STATE_CHUNK_BYTES = 16000;
@@ -774,7 +773,7 @@ function sendInput(force = false) {
 
 function setKey(key, pressed) {
   if (!(key in state.input) || state.input[key] === pressed) return;
-  if (state.self?.slot === 1 && state.hostAwaitingPeerSync) {
+  if (state.self?.slot === 1 && state.hostBarrierPaused) {
     if (pressed) log("host_input_blocked", { key, reason: "peer_sync_barrier" }, "WARN");
     return;
   }
@@ -788,6 +787,16 @@ function setupKeyboard() {
   const releaseKeys = () => { let changed = false; for (const key of Object.keys(state.input)) { if (state.input[key]) { state.input[key] = false; changed = true; } } if (changed) { applyLocalInput(); sendInput(true); log("input_reset", { reason: "window_blur" }); } };
   window.addEventListener("keydown", (event) => { const key = keys[event.key.toLowerCase()]; if (!key) return; event.preventDefault(); setKey(key, true); });
   window.addEventListener("keyup", (event) => { const key = keys[event.key.toLowerCase()]; if (!key) return; event.preventDefault(); setKey(key, false); });
+  const gameSurface = $("game");
+  gameSurface.addEventListener("pointerdown", (event) => {
+    if (!state.self || event.button !== 0) return;
+    // Mirror a click on EmulatorJS's game/control surface as a shared A press.
+    // This covers the on-screen A/continue control, which does not pass
+    // through the page keyboard listeners.
+    setKey("a", true);
+    window.setTimeout(() => setKey("a", false), 80);
+    log("pointer_input_sent", { button: "a", slot: state.self.slot });
+  }, { passive: true });
   window.addEventListener("blur", releaseKeys);
   document.addEventListener("visibilitychange", () => { if (document.hidden) releaseKeys(); });
   window.setInterval(() => { if (state.self) sendInput(true); }, 16);
@@ -808,7 +817,7 @@ async function launchEmulator(reason = "manual") {
   $("bridgeCoreState").textContent = "LOADING";
   $("bridgeCoreState").className = "amber";
   $("bridgeBadge").textContent = "BOOTING";
-  $("emulatorStatus").textContent = "Loading Parallel N64 core…";
+  $("emulatorStatus").textContent = "Loading Mupen64Plus-Next core…";
   log("emulator_boot_requested", { reason, core: EMULATOR_CORE, dataPath: "https://cdn.emulatorjs.org/stable/data/", rom: state.rom.name });
   window.EJS_player = "#game";
   window.EJS_core = EMULATOR_CORE;
@@ -820,7 +829,11 @@ async function launchEmulator(reason = "manual") {
   window.EJS_volume = 0.8;
   window.EJS_threads = Boolean(window.crossOriginIsolated && window.SharedArrayBuffer);
   window.EJS_disableLocalStorage = true;
-  window.EJS_defaultOptions = { ...(window.EJS_defaultOptions || {}), vsync: "enabled", shader: "disabled", webgl2Enabled: "enabled" };
+  // Let Mupen64Plus-Next select its supported WebGL path. The old
+  // webgl2Enabled internal flag could force a mismatched renderer and cause
+  // corrupted N64 frames on some browsers.
+  window.EJS_forceLegacyCores = false;
+  window.EJS_defaultOptions = { ...(window.EJS_defaultOptions || {}), vsync: "enabled", shader: "disabled" };
   window.EJS_startOnLoaded = true;
   window.EJS_DEBUG_XX = true;
   window.EJS_controlScheme = "n64";
