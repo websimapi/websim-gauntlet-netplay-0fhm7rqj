@@ -610,6 +610,10 @@ function handleRoomMessage(raw) {
     renderPlayers();
     const selfFrame = state.players.find((player) => player.id === state.self?.id);
     if (selfFrame) $("inputReadout").innerHTML = `P${selfFrame.slot} INPUT <span>SEQ ${selfFrame.seq}</span>`;
+    // The relay is low-latency, while snapshots are the reliable recovery
+    // path if a single room message is missed. Sequence de-duplication keeps
+    // this from applying the same controller frame twice.
+    if (isHost()) applyRemoteInputs(state.players);
     if (message.tick % 20 === 0) log("authoritative_snapshot", { lobbyId: message.lobbyId, tick: message.tick, players: state.players.length, serverTime: message.serverTime });
   }
 }
