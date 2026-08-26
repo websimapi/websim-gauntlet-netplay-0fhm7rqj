@@ -420,6 +420,7 @@ async function startHostStreamForPeer(peer, force = false) {
 }
 
 async function handleStreamRequest(message) {
+  if (message.targetId && message.targetId !== state.self?.id) return;
   if (!isHost() || !state.lobby || message.lobbyId !== state.lobby.id || !message.fromId) return;
   const peer = state.players.find((player) => player.id === message.fromId) || message.player;
   if (!peer) return;
@@ -450,6 +451,7 @@ function showRemoteStream(stream) {
 }
 
 async function handleStreamSignal(message) {
+  if (message.targetId && message.targetId !== state.self?.id) return;
   if (!state.lobby || message.lobbyId !== state.lobby.id || !message.fromId || !message.signal) return;
   const { signal, fromId } = message;
   if (isHost()) {
@@ -534,7 +536,7 @@ function handleRoomMessage(raw) {
   if (message.type === "protocol_error") { log("protocol_error", message, "ERROR"); return; }
   if (message.type === "stream_request") { handleStreamRequest(message); return; }
   if (message.type === "stream_signal") {
-    log("host_stream_signal_received", { fromId: message.fromId, kind: message.signal?.kind, descriptionType: message.signal?.description?.type || null });
+    if (!message.targetId || message.targetId === state.self?.id) log("host_stream_signal_received", { fromId: message.fromId, kind: message.signal?.kind, descriptionType: message.signal?.description?.type || null });
     handleStreamSignal(message);
     return;
   }

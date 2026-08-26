@@ -236,7 +236,7 @@ export const room = {
         conn.send({ type: "protocol_error", code: "BAD_STREAM_SIGNAL" });
         return;
       }
-      target.conn.send({ type: "stream_signal", lobbyId: lobby.id, fromId: conn.id, signal });
+      room.broadcast({ type: "stream_signal", lobbyId: lobby.id, targetId: target.conn.id, fromId: conn.id, signal });
       console.log(JSON.stringify({ event: "stream_signal_relay", lobbyId: lobby.id, fromId: conn.id, toId: target.conn.id, kind: signal.kind, descriptionType: signal.description?.type || null }));
       return;
     }
@@ -247,7 +247,7 @@ export const room = {
         conn.send({ type: "protocol_error", code: "BAD_STREAM_REQUEST" });
         return;
       }
-      host.conn.send({ type: "stream_request", lobbyId: lobby.id, fromId: conn.id, player: memberSummary(me) });
+      room.broadcast({ type: "stream_request", lobbyId: lobby.id, targetId: host.conn.id, fromId: conn.id, player: memberSummary(me) });
       console.log(JSON.stringify({ event: "stream_request_relay", lobbyId: lobby.id, fromId: conn.id, hostId: host.conn.id }));
       return;
     }
