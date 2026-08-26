@@ -239,7 +239,7 @@ export const room = {
         const encoding = input.encoding === "gzip" ? "gzip" : input.encoding === "identity" ? "identity" : "";
         if (!syncId || !Number.isSafeInteger(totalBytes) || totalBytes < 1 || totalBytes > 20 * 1024 * 1024 || !Number.isSafeInteger(rawBytes) || rawBytes < 1 || rawBytes > 32 * 1024 * 1024 || !Number.isSafeInteger(totalChunks) || totalChunks < 1 || totalChunks > 900 || !encoding) { conn.send({ type: "state_sync_rejected", code: "BAD_STATE_HEADER" }); return; }
         lobby.stateSync = { syncId, totalBytes, rawBytes, totalChunks, encoding, chunks: new Array(totalChunks), received: 0, stateTick: Number(input.stateTick) || 0, romKey: lobby.romKey, patchProfile: lobby.patchProfile };
-        room.broadcast({ type: "host_state_begin", lobbyId: lobby.id, syncId, totalBytes, rawBytes, totalChunks, encoding, stateTick: lobby.stateSync.stateTick, romKey: lobby.romKey, patchProfile: lobby.patchProfile }, { except: conn });
+        room.broadcast({ type: "host_state_begin", lobbyId: lobby.id, syncId, totalBytes, rawBytes, totalChunks, encoding, stateTick: lobby.stateSync.stateTick, romKey: lobby.romKey, patchProfile: lobby.patchProfile }, { except: [conn.id] });
         return;
       }
       if (!lobby.stateSync || String(input.syncId) !== lobby.stateSync.syncId) { conn.send({ type: "state_sync_rejected", code: "UNKNOWN_STATE_SYNC" }); return; }
@@ -248,13 +248,13 @@ export const room = {
         const data = String(input.data || "");
         if (!Number.isSafeInteger(index) || index < 0 || index >= lobby.stateSync.totalChunks || data.length > 44000) { conn.send({ type: "state_sync_rejected", code: "BAD_STATE_CHUNK" }); return; }
         if (!lobby.stateSync.chunks[index]) { lobby.stateSync.chunks[index] = data; lobby.stateSync.received += 1; }
-        room.broadcast({ type: "host_state_chunk", lobbyId: lobby.id, syncId: lobby.stateSync.syncId, index, data }, { except: conn });
+        room.broadcast({ type: "host_state_chunk", lobbyId: lobby.id, syncId: lobby.stateSync.syncId, index, data }, { except: [conn.id] });
         return;
       }
       if (lobby.stateSync.received !== lobby.stateSync.totalChunks) { conn.send({ type: "state_sync_rejected", code: "STATE_INCOMPLETE", received: lobby.stateSync.received, expected: lobby.stateSync.totalChunks }); return; }
       lobby.stateVersion += 1;
       await env.DB.prepare("UPDATE lobby_runtime SET state_version = ?, updated_at = ? WHERE lobby_id = ?").bind(lobby.stateVersion, Date.now(), lobby.id).run();
-      room.broadcast({ type: "host_state_end", lobbyId: lobby.id, syncId: lobby.stateSync.syncId, stateVersion: lobby.stateVersion, stateTick: lobby.stateSync.stateTick, rawBytes: lobby.stateSync.rawBytes, encoding: lobby.stateSync.encoding, serverTime: Date.now() }, { except: conn });
+      room.broadcast({ type: "host_state_end", lobbyId: lobby.id, syncId: lobby.stateSync.syncId, stateVersion: lobby.stateVersion, stateTick: lobby.stateSync.stateTick, rawBytes: lobby.stateSync.rawBytes, encoding: lobby.stateSync.encoding, serverTime: Date.now() }, { except: [conn.id] });
       conn.send({ type: "host_state_committed", lobbyId: lobby.id, syncId: lobby.stateSync.syncId, stateVersion: lobby.stateVersion, bytes: lobby.stateSync.totalBytes, rawBytes: lobby.stateSync.rawBytes, encoding: lobby.stateSync.encoding });
       console.log(JSON.stringify({ event: "host_state_committed", lobbyId: lobby.id, stateVersion: lobby.stateVersion, bytes: lobby.stateSync.totalBytes, rawBytes: lobby.stateSync.rawBytes, encoding: lobby.stateSync.encoding }));
       return;

@@ -381,7 +381,7 @@ function handleRoomMessage(raw) {
     state.incomingStateSync = null;
     decompressState(packedBytes, sync.encoding).then((bytes) => {
       if (sync.rawBytes && bytes.byteLength !== sync.rawBytes) throw new Error(`decoded state is ${bytes.byteLength} bytes; expected ${sync.rawBytes}`);
-      state.pendingHostState = { bytes, stateTick: message.stateTick, stateVersion: message.stateVersion };
+      state.pendingHostState = { bytes, stateTick: message.stateTick, stateVersion: message.stateVersion, attempts: 0 };
       log("host_state_received", { syncId: message.syncId, bytes: packedBytes.byteLength, rawBytes: bytes.byteLength, encoding: sync.encoding, stateTick: message.stateTick, stateVersion: message.stateVersion });
       return applyPendingHostState();
     }).catch((error) => log("host_state_decode_error", { syncId: sync.syncId, encoding: sync.encoding, message: error.message }, "ERROR"));
@@ -505,7 +505,14 @@ async function sendHostCheckpoint(reason = "periodic") {
     }
     state.room.send({ type: "host_state_end", syncId, stateTick: state.lastServerTick || 0 });
     log("host_state_sent", { reason, syncId, bytes: packed.bytes.byteLength, rawBytes: bytes.byteLength, compression: `${Math.round((packed.bytes.byteLength / bytes.byteLength) * 100)}%`, encoding: packed.encoding, totalChunks });
-  } catch (error) { log("host_state_error", { reason, message: error.message }, "ERROR"); }
+  } catch (error) {
+    const message = error?.message || String(error);
+    log("host_state_error", { reason, message }, "ERROR");
+    if (reason === "capabilities_ready" && /null function/i.test(message)) {
+      log("host_state_retry_scheduled", { reason: "capabilities_retry", delayMs: 600 }, "WARN");
+      scheduleHostCheckpoint("capabilities_retry");
+    }
+  }
   finally { state.stateSyncInFlight = false; if (paused && typeof window.EJS_emulator.play === "function") window.EJS_emulator.play(); }
 }
 
@@ -514,9 +521,21 @@ async function applyPendingHostState() {
   const gameManager = window.EJS_emulator?.gameManager;
   if (typeof gameManager?.loadState !== "function") { log("host_state_apply_unavailable", { loadState: false }, "ERROR"); return; }
   const pending = state.pendingHostState;
-  state.pendingHostState = null;
-  try { await gameManager.loadState(pending.bytes); $("emulatorStatus").textContent = `Synced to host · state ${pending.stateVersion}`; $("bridgeBadge").textContent = "HOST SYNCED"; log("host_state_applied", { bytes: pending.bytes.byteLength, stateTick: pending.stateTick, stateVersion: pending.stateVersion }); }
-  catch (error) { log("host_state_apply_error", { message: error.message }, "ERROR"); }
+  try {
+    await gameManager.loadState(pending.bytes);
+    if (state.pendingHostState === pending) state.pendingHostState = null;
+    $("emulatorStatus").textContent = `Synced to host · state ${pending.stateVersion}`;
+    $("bridgeBadge").textContent = "HOST SYNCED";
+    log("host_state_applied", { bytes: pending.bytes.byteLength, stateTick: pending.stateTick, stateVersion: pending.stateVersion });
+  } catch (error) {
+    const message = error?.message || String(error);
+    log("host_state_apply_error", { message, attempt: pending.attempts + 1 }, "ERROR");
+    if (pending.attempts < 3 && state.pendingHostState === pending) {
+      pending.attempts += 1;
+      window.setTimeout(applyPendingHostState, 500);
+      log("host_state_apply_retry_scheduled", { attempt: pending.attempts, delayMs: 500 }, "WARN");
+    }
+  }
 }
 
 function inputSignature() { return JSON.stringify(state.input); }
