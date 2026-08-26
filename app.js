@@ -533,7 +533,6 @@ async function sendHostCheckpoint(reason = "periodic") {
     const rawState = gameManager.getState();
     const bytes = new Uint8Array(rawState instanceof Uint8Array ? rawState : new Uint8Array(rawState));
     if (!bytes.byteLength) throw new Error("Emulator returned an empty savestate");
-    if (paused && typeof window.EJS_emulator.play === "function") { window.EJS_emulator.play(); paused = false; }
     const packed = await compressState(bytes);
     if (packed.bytes.byteLength > 20 * 1024 * 1024) throw new Error(`Compressed savestate is ${packed.bytes.byteLength} bytes; room limit is 20 MB`);
     const chunkSize = 28000;
@@ -630,6 +629,8 @@ async function launchEmulator(reason = "manual") {
   game.innerHTML = "";
   state.emulatorStarted = true;
   state.emulatorReady = false;
+  state.hostStateRetryCount = 0;
+  state.hostCheckpointPending = null;
   $("bridgeCoreState").textContent = "LOADING";
   $("bridgeCoreState").className = "amber";
   $("bridgeBadge").textContent = "BOOTING";
