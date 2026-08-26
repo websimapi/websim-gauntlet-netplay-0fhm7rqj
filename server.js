@@ -1,6 +1,7 @@
 const MAX_PLAYERS = 4;
 const MAX_STREAM_SIGNAL_CHARS = 48000;
 const MAX_AXIS_VALUE = 0x7fff;
+const SNAPSHOT_EVERY_TICKS = 2;
 const INPUT_KEYS = ["up", "down", "left", "right", "dUp", "dDown", "dLeft", "dRight", "a", "b", "z", "start", "l", "r", "cUp", "cDown", "cLeft", "cRight"];
 const activeLobbies = new Map();
 const connectionLobbies = new Map();
@@ -273,6 +274,7 @@ export const room = {
     for (const lobby of activeLobbies.values()) {
       if (!lobby.members.size) continue;
       lobby.tick += 1;
+      if (lobby.tick % SNAPSHOT_EVERY_TICKS !== 0) continue;
       const players = [...lobby.members.values()].sort((a, b) => a.slot - b.slot).map((member) => ({
         id: member.conn.id,
         username: member.username,

@@ -131,9 +131,11 @@ h2 { margin: 0; font-size: 20px; letter-spacing: -.04em; font-weight: 500; }
 .input-readout span { color: var(--lime); }
 .emulator-shell { border: 1px solid var(--line-bright); background: #050a09; padding: 10px; }
 .emulator-topline { height: 26px; display: flex; justify-content: space-between; align-items: start; color: var(--dim); font: 9px var(--mono); letter-spacing: .04em; }
-.emulator-viewport { width: 100%; aspect-ratio: 4 / 3; min-height: 0; display: flex; align-items: center; justify-content: center; background: radial-gradient(circle at 50% 40%, rgba(47, 93, 72, .25), transparent 43%), repeating-linear-gradient(0deg, rgba(255,255,255,.015) 0 1px, transparent 1px 4px), #08110f; overflow: hidden; position: relative; }
-.emulator-game { width: 100%; height: 100%; min-height: 0; display: flex; align-items: center; justify-content: center; }
-.emulator-game canvas, .remote-game { display: block; width: 100% !important; height: 100% !important; max-height: none; object-fit: contain; }
+.emulator-viewport { width: min(100%, 1024px); aspect-ratio: 4 / 3; min-height: 0; margin-inline: auto; display: flex; align-items: center; justify-content: center; background: radial-gradient(circle at 50% 40%, rgba(47, 93, 72, .25), transparent 43%), repeating-linear-gradient(0deg, rgba(255,255,255,.015) 0 1px, transparent 1px 4px), #08110f; overflow: hidden; position: relative; contain: layout paint; }
+.emulator-game, .emulator-game.ejs_parent, .emulator-game .ejs_game, .emulator-game .ejs_canvas_parent { width: 100% !important; height: 100% !important; min-width: 0; min-height: 0; }
+.emulator-game { position: relative; display: block; overflow: hidden; }
+.emulator-game canvas.ejs_canvas { position: absolute; inset: 0; display: block; width: 100% !important; height: 100% !important; max-width: 100%; max-height: 100%; object-fit: contain; }
+.remote-game { display: block; width: 100% !important; height: 100% !important; max-width: 100%; max-height: 100%; object-fit: contain; }
 .remote-game { position: absolute; inset: 0; z-index: 3; background: #000; }
 .emulator-placeholder { display: flex; flex-direction: column; align-items: center; gap: 10px; color: var(--dim); font: 10px var(--mono); letter-spacing: .05em; }
 .emulator-placeholder strong { color: var(--muted); font-size: 12px; font-weight: 500; }

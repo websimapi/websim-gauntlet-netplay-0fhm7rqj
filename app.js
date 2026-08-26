@@ -4,9 +4,9 @@ const EMULATOR_CORE = "mupen64plus_next";
 const INPUT_HEARTBEAT_MS = 33;
 const ANALOG_MAX = 0x7fff;
 const STREAM_CAPTURE_FPS = 30;
-const STREAM_MAX_BITRATE = 2500000;
+const STREAM_MAX_BITRATE = 1800000;
 const STREAM_AUDIO_MAX_BITRATE = 128000;
-const STREAM_CONFIG = { iceServers: [{ urls: "stun:stun.l.google.com:19302" }] };
+const STREAM_CONFIG = { iceServers: [{ urls: "stun:stun.l.google.com:19302" }], bundlePolicy: "max-bundle", rtcpMuxPolicy: "require" };
 
 const state = {
   user: null,
@@ -36,8 +36,11 @@ const state = {
   remoteStreamConnection: null,
   remoteStreamCandidates: [],
   remoteAppliedInputSeq: new Map(),
+  remoteInputState: new Map(),
+  localInputState: null,
   hostStreamRequestTimer: null,
   hostStreamTimer: null,
+  playerLayoutKey: "",
 };
 
 const $ = (id) => document.getElementById(id);
@@ -227,6 +230,9 @@ function buildReport() {
 
 function renderPlayers() {
   const slots = $("playerSlots");
+  const layoutKey = state.players.map((player) => `${player.id}:${player.slot}:${player.username || ""}`).join("|");
+  if (layoutKey === state.playerLayoutKey && slots.childElementCount === 4) return;
+  state.playerLayoutKey = layoutKey;
   const playersBySlot = new Map(state.players.map((player) => [player.slot, player]));
   slots.innerHTML = [1, 2, 3, 4].map((slot) => {
     const player = playersBySlot.get(slot);
@@ -358,6 +364,8 @@ function closeAllStreams() {
   for (const peerId of state.hostStreamPeers.keys()) closeHostStreamPeer(peerId);
   state.hostStreamOfferPromises.clear();
   state.remoteAppliedInputSeq.clear();
+  state.remoteInputState.clear();
+  state.localInputState = null;
   if (state.hostStream) state.hostStream.getTracks().forEach((track) => track.stop());
   state.hostStream = null;
   closeRemoteStream();
@@ -383,12 +391,23 @@ function captureHostMedia(canvas) {
     const capture = window.EJS_emulator?.collectScreenRecordingMediaTracks;
     if (typeof capture === "function") {
       const stream = capture.call(window.EJS_emulator, canvas, STREAM_CAPTURE_FPS);
-      if (stream?.getVideoTracks?.().length) return stream;
+      if (stream?.getVideoTracks?.().length) {
+        stream.getVideoTracks().forEach((track) => { track.contentHint = "motion"; });
+        stream.getAudioTracks().forEach((track) => { track.contentHint = "music"; });
+        return stream;
+      }
     }
   } catch (error) {
     log("host_media_audio_capture_fallback", { message: error.message }, "WARN");
   }
-  return canvas.captureStream(STREAM_CAPTURE_FPS);
+  const stream = canvas.captureStream(STREAM_CAPTURE_FPS);
+  stream.getVideoTracks().forEach((track) => { track.contentHint = "motion"; });
+  return stream;
+}
+
+function refreshEmulatorLayout() {
+  const emulator = window.EJS_emulator;
+  try { if (typeof emulator?.handleResize === "function") emulator.handleResize(); } catch (error) { log("emulator_resize_error", { message: error.message }, "WARN"); }
 }
 
 async function ensureHostStreams() {
@@ -423,12 +442,17 @@ async function startHostStreamForPeer(peer, force = false) {
   state.hostStreamPeers.set(peer.id, connection);
   for (const track of state.hostStream.getTracks()) {
     const sender = connection.addTrack(track, state.hostStream);
-    if (track.kind === "video" && typeof sender.setParameters === "function") {
+    if (typeof sender.setParameters === "function") {
       const parameters = sender.getParameters();
       parameters.encodings = parameters.encodings?.length ? parameters.encodings : [{}];
       parameters.encodings[0].maxBitrate = track.kind === "audio" ? STREAM_AUDIO_MAX_BITRATE : STREAM_MAX_BITRATE;
-      if (track.kind === "video") parameters.encodings[0].maxFramerate = STREAM_CAPTURE_FPS;
-      sender.setParameters(parameters).catch(() => {});
+      parameters.encodings[0].priority = "high";
+      parameters.encodings[0].networkPriority = "high";
+      if (track.kind === "video") {
+        parameters.encodings[0].maxFramerate = STREAM_CAPTURE_FPS;
+        parameters.degradationPreference = "maintain-framerate";
+      }
+      try { Promise.resolve(sender.setParameters(parameters)).catch(() => {}); } catch {}
     }
   }
   connection.onicecandidate = ({ candidate }) => {
@@ -486,8 +510,12 @@ function showRemoteStream(stream) {
   if (state.hostStreamRequestTimer) window.clearTimeout(state.hostStreamRequestTimer);
   state.hostStreamRequestTimer = null;
   video.srcObject = stream;
+  video.muted = false;
+  video.volume = 1;
+  video.defaultPlaybackRate = 1;
+  video.playbackRate = 1;
   video.classList.remove("hidden");
-  video.play().catch(() => {});
+  video.play().catch((error) => log("host_stream_play_error", { message: error.message }, "WARN"));
   $("emulatorStatus").textContent = "Live host feed · controller connected";
   $("bridgeBadge").textContent = "HOST STREAM";
   $("bridgeBadge").classList.add("live");
@@ -640,29 +668,45 @@ function applyAnalogInput(port, axisX, axisY) {
 function applyRemoteInputs(players) {
   const hook = getInputHook();
   if (!hook) return;
-  for (const player of players) {
+  const activeIds = new Set((players || []).filter((player) => player.id !== state.self?.id).map((player) => player.id));
+  for (const [playerId, previous] of state.remoteInputState) {
+    if (activeIds.has(playerId)) continue;
+    applyControllerInput(Math.max(0, previous.slot - 1), { buttons: {}, axisX: 0, axisY: 0 }, previous);
+    state.remoteInputState.delete(playerId);
+    state.remoteAppliedInputSeq.delete(playerId);
+  }
+  for (const player of players || []) {
     if (player.id === state.self?.id || !player.input) continue;
-    if (state.remoteAppliedInputSeq.get(player.id) === player.input.seq) continue;
-    applyAnalogInput(Math.max(0, player.slot - 1), player.input.axisX, player.input.axisY);
-    for (const [key, value] of Object.entries(player.input.buttons || {})) {
-      if (!(key in controllerButtonMap)) continue;
-      try { hook(Math.max(0, player.slot - 1), controllerButtonMap[key], value ? 1 : 0); } catch (error) { log("remote_input_hook_error", { player: player.slot, key, message: error.message }, "WARN"); }
-    }
+    const previous = state.remoteInputState.get(player.id);
+    if (previous?.seq === player.input.seq) continue;
+    const applied = applyControllerInput(Math.max(0, player.slot - 1), player.input, previous);
+    state.remoteInputState.set(player.id, { ...applied, seq: player.input.seq, slot: player.slot });
     state.remoteAppliedInputSeq.set(player.id, player.input.seq);
   }
+}
+
+function applyControllerInput(port, input, previous = null) {
+  const hook = getInputHook();
+  if (!hook) return previous || { axisX: 0, axisY: 0, buttons: {}, slot: port + 1 };
+  const axisX = Number(input?.axisX) || 0;
+  const axisY = Number(input?.axisY) || 0;
+  const previousButtons = previous?.buttons || {};
+  const buttons = input?.buttons || {};
+  if (!previous || previous.axisX !== axisX || previous.axisY !== axisY) applyAnalogInput(port, axisX, axisY);
+  for (const key of Object.keys(controllerButtonMap)) {
+    const pressed = buttons[key] === true;
+    if (previous && previousButtons[key] === pressed) continue;
+    try { hook(port, controllerButtonMap[key], pressed ? 1 : 0); } catch (error) { log("input_hook_error", { player: port + 1, key, message: error.message }, "WARN"); }
+  }
+  return { axisX, axisY, buttons: Object.fromEntries(Object.keys(controllerButtonMap).map((key) => [key, buttons[key] === true])) };
 }
 
 const controllerButtonMap = { a: 0, b: 8, z: 12, start: 3, l: 10, r: 11, dUp: 4, dDown: 5, dLeft: 6, dRight: 7, cUp: 23, cDown: 22, cLeft: 21, cRight: 20 };
 
 function applyLocalInput() {
-  const hook = getInputHook();
-  if (!hook || !state.self) return;
+  if (!getInputHook() || !state.self) return;
   const axes = analogAxes(state.input);
-  applyAnalogInput(Math.max(0, state.self.slot - 1), axes.axisX, axes.axisY);
-  for (const [key, value] of Object.entries(state.input)) {
-    if (!(key in controllerButtonMap)) continue;
-    try { hook(Math.max(0, state.self.slot - 1), controllerButtonMap[key], value ? 1 : 0); } catch (error) { log("local_input_hook_error", { player: state.self.slot, key, message: error.message }, "WARN"); }
-  }
+  state.localInputState = applyControllerInput(Math.max(0, state.self.slot - 1), { buttons: state.input, axisX: axes.axisX, axisY: axes.axisY }, state.localInputState);
 }
 
 function getInputHook() {
@@ -758,7 +802,7 @@ async function launchEmulator(reason = "manual") {
   window.EJS_pathtodata = "https://cdn.emulatorjs.org/stable/data/";
   window.EJS_gameID = 64;
   window.EJS_volume = 0.8;
-  window.EJS_threads = Boolean(window.crossOriginIsolated && window.SharedArrayBuffer);
+  window.EJS_threads = Boolean(window.crossOriginIsolated && typeof window.SharedArrayBuffer === "function");
   window.EJS_disableLocalStorage = true;
   // Let Mupen64Plus-Next select its supported WebGL path. The old
   // webgl2Enabled internal flag could force a mismatched renderer and cause
@@ -768,7 +812,7 @@ async function launchEmulator(reason = "manual") {
   window.EJS_startOnLoaded = true;
   window.EJS_DEBUG_XX = false;
   window.EJS_controlScheme = "n64";
-  window.EJS_ready = () => { state.emulatorReady = true; $("bridgeCoreState").textContent = "READY"; $("bridgeCoreState").className = "ready"; $("bridgeBadge").textContent = "CORE READY"; $("bridgeBadge").classList.add("live"); $("emulatorStatus").textContent = "N64 host core ready"; log("emulator_ready", { core: EMULATOR_CORE, inputHook: Boolean(getInputHook()), getState: typeof window.EJS_emulator?.gameManager?.getState === "function", loadState: typeof window.EJS_emulator?.gameManager?.loadState === "function", threads: Boolean(window.EJS_threads), crossOriginIsolated: Boolean(window.crossOriginIsolated), vsync: window.EJS_defaultOptions?.vsync, volume: window.EJS_volume }); waitForEmulatorCapabilities(); };
+  window.EJS_ready = () => { state.emulatorReady = true; refreshEmulatorLayout(); $("bridgeCoreState").textContent = "READY"; $("bridgeCoreState").className = "ready"; $("bridgeBadge").textContent = "CORE READY"; $("bridgeBadge").classList.add("live"); $("emulatorStatus").textContent = "N64 host core ready"; log("emulator_ready", { core: EMULATOR_CORE, inputHook: Boolean(getInputHook()), getState: typeof window.EJS_emulator?.gameManager?.getState === "function", loadState: typeof window.EJS_emulator?.gameManager?.loadState === "function", threads: Boolean(window.EJS_threads), crossOriginIsolated: Boolean(window.crossOriginIsolated), hardwareConcurrency: navigator.hardwareConcurrency || null, vsync: window.EJS_defaultOptions?.vsync, volume: window.EJS_volume }); waitForEmulatorCapabilities(); };
   window.EJS_onExit = () => { state.emulatorStarted = false; state.emulatorReady = false; if (isHost()) closeAllStreams(); $("emulatorStatus").textContent = "Emulator exited"; log("emulator_exit"); };
   if (state.emulatorScript) state.emulatorScript.remove();
   const script = document.createElement("script");
@@ -811,7 +855,10 @@ function bindUI() {
 }
 
 async function boot() {
-  bindUI(); setupKeyboard(); window.setInterval(tickClock, 1000); refreshLobbies();
+  bindUI(); setupKeyboard(); window.setInterval(tickClock, 1000);
+  let resizeTimer = null;
+  window.addEventListener("resize", () => { window.clearTimeout(resizeTimer); resizeTimer = window.setTimeout(refreshEmulatorLayout, 80); }, { passive: true });
+  refreshLobbies();
   try { state.user = await window.websim?.getUser?.(); log("identity_loaded", { signedIn: Boolean(state.user), username: state.user?.username || null }); }
   catch (error) { log("identity_error", { message: error.message }, "WARN"); }
   log("client_ready", { browser: navigator.userAgent, protocol: "host-authority/1.0" });
