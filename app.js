@@ -2,6 +2,9 @@
 // public N64 docs call this core "parallel-n64", but stable/data/cores uses
 // "parallel_n64" (for example, parallel_n64-wasm.data).
 const EMULATOR_CORE = "parallel_n64";
+// Keep WebSocket payloads comfortably below browser/proxy message-size
+// boundaries. 16,000 packed bytes become at most ~21,334 base64url chars.
+const STATE_CHUNK_BYTES = 16000;
 
 const state = {
   user: null,
@@ -33,6 +36,7 @@ const state = {
   hostStateRetryCount: 0,
   hostAwaitingPeerSync: false,
   hostBarrierPaused: false,
+  hostReadySignalSent: false,
   hostSyncBarrierId: null,
   hostSyncTargetVersion: 0,
   peerSyncHold: false,
@@ -221,7 +225,7 @@ function buildReport() {
     viewport: `${window.innerWidth}x${window.innerHeight}`,
     rom: state.romMeta ? { ...state.romMeta } : null,
     connection: { lobby: state.lobby?.id || null, self: state.self, players: state.players.map(({ id, username, slot, seq }) => ({ id, username, slot, seq })), lastAck: state.lastAck },
-    emulator: { core: EMULATOR_CORE, started: state.emulatorStarted, ready: state.emulatorReady, EJS: Boolean(window.EJS_emulator), gameManager: Boolean(window.EJS_emulator?.gameManager), simulateInput: typeof window.EJS_emulator?.gameManager?.simulateInput === "function", globalSimulateInput: typeof window.simulate_input === "function", inputHook: Boolean(getInputHook()), getState: typeof window.EJS_emulator?.gameManager?.getState === "function", loadState: typeof window.EJS_emulator?.gameManager?.loadState === "function", compressionStream: typeof CompressionStream === "function", decompressionStream: typeof DecompressionStream === "function", crossOriginIsolated: Boolean(window.crossOriginIsolated), threads: Boolean(window.EJS_threads), volume: window.EJS_volume ?? null },
+    emulator: { core: EMULATOR_CORE, started: state.emulatorStarted, ready: state.emulatorReady, hostReadySignalSent: state.hostReadySignalSent, EJS: Boolean(window.EJS_emulator), gameManager: Boolean(window.EJS_emulator?.gameManager), simulateInput: typeof window.EJS_emulator?.gameManager?.simulateInput === "function", globalSimulateInput: typeof window.simulate_input === "function", inputHook: Boolean(getInputHook()), getState: typeof window.EJS_emulator?.gameManager?.getState === "function", loadState: typeof window.EJS_emulator?.gameManager?.loadState === "function", compressionStream: typeof CompressionStream === "function", decompressionStream: typeof DecompressionStream === "function", crossOriginIsolated: Boolean(window.crossOriginIsolated), threads: Boolean(window.EJS_threads), volume: window.EJS_volume ?? null },
     stateSync: { incoming: state.incomingStateSync ? { syncId: state.incomingStateSync.syncId, received: state.incomingStateSync.received, totalChunks: state.incomingStateSync.totalChunks, bytes: state.incomingStateSync.totalBytes, rawBytes: state.incomingStateSync.rawBytes, encoding: state.incomingStateSync.encoding, chunkEncoding: state.incomingStateSync.chunkEncoding, stateVersion: state.incomingStateSync.stateVersion, barrierId: state.incomingStateSync.barrierId } : null, pending: state.pendingHostState ? { syncId: state.pendingHostState.syncId, stateVersion: state.pendingHostState.stateVersion, barrierId: state.pendingHostState.barrierId } : null, sending: state.stateSyncInFlight, hostAwaitingPeerSync: state.hostAwaitingPeerSync, hostBarrierPaused: state.hostBarrierPaused, hostSyncTargetVersion: state.hostSyncTargetVersion, peerSyncHold: state.peerSyncHold, peerSyncPaused: state.peerSyncPaused, peerSyncTargetVersion: state.peerSyncTargetVersion, lastAppliedStateVersion: state.lastAppliedStateVersion },
     protocol: { name: "input-authority/0.1", serverTickMs: 16, inputSendMs: 16, stateSyncPolicy: "join-barrier-only", inputSequence: state.seq, currentInput: state.input },
     recentLogs: state.logs.slice(-80),
@@ -297,6 +301,7 @@ async function connectRoom() {
     state.lastLoggedInput = "";
     state.hostAwaitingPeerSync = false;
     state.hostBarrierPaused = false;
+    state.hostReadySignalSent = false;
     state.hostSyncBarrierId = null;
     state.hostSyncTargetVersion = 0;
     state.peerSyncHold = false;
@@ -342,6 +347,7 @@ function handleRoomMessage(raw) {
     state.lastLoggedInput = "";
     state.hostAwaitingPeerSync = false;
     state.hostBarrierPaused = false;
+    state.hostReadySignalSent = false;
     state.hostSyncBarrierId = null;
     state.hostSyncTargetVersion = 0;
     state.peerSyncHold = false;
@@ -593,7 +599,16 @@ async function waitForEmulatorCapabilities() {
       if (state.self?.slot === 1 && state.players.length > 1) scheduleHostCheckpoint("capabilities_ready");
     }
     if (capabilities.inputHook) applyLocalInput();
-    if (capabilities.inputHook && capabilities.getState && capabilities.loadState) { log("emulator_capabilities_ready", { ...capabilities, waitMs: Math.round(performance.now() - startedAt) }); applyPendingHostState(); return; }
+    if (capabilities.inputHook && capabilities.getState && capabilities.loadState) {
+      log("emulator_capabilities_ready", { ...capabilities, waitMs: Math.round(performance.now() - startedAt) });
+      if (state.self?.slot === 1 && !state.hostReadySignalSent) {
+        state.hostReadySignalSent = true;
+        state.room?.send({ type: "host_emulator_ready", romKey: state.romMeta?.romKey, patchProfile: state.romMeta?.patchProfile });
+        log("host_ready_signal_sent", { lobbyId: state.lobby?.id || null, core: EMULATOR_CORE });
+      }
+      applyPendingHostState();
+      return;
+    }
     await new Promise((resolve) => window.setTimeout(resolve, 100));
   }
   log("emulator_capabilities_timeout", { inputHook: Boolean(getInputHook()), getState: typeof window.EJS_emulator?.gameManager?.getState === "function", loadState: typeof window.EJS_emulator?.gameManager?.loadState === "function", waitMs: Math.round(performance.now() - startedAt) }, "WARN");
@@ -660,12 +675,22 @@ async function sendHostCheckpoint(reason = "periodic") {
       try { window.EJS_emulator.pause(); state.hostBarrierPaused = true; log("host_sync_barrier_paused", { reason, stateTick: state.lastServerTick || 0 }); }
       catch (error) { throw new Error(`Unable to pause host emulator: ${error.message}`); }
     }
-    const rawState = gameManager.getState();
+    let rawState;
+    for (let attempt = 1; attempt <= 6; attempt += 1) {
+      try {
+        rawState = gameManager.getState();
+        break;
+      } catch (error) {
+        if (attempt === 6) throw error;
+        log("host_state_capture_retry", { reason, attempt, delayMs: 120, message: error?.message || String(error) }, "WARN");
+        await new Promise((resolve) => window.setTimeout(resolve, 120));
+      }
+    }
     const bytes = new Uint8Array(rawState instanceof Uint8Array ? rawState : new Uint8Array(rawState));
     if (!bytes.byteLength) throw new Error("Emulator returned an empty savestate");
     const packed = await compressState(bytes);
     if (packed.bytes.byteLength > 20 * 1024 * 1024) throw new Error(`Compressed savestate is ${packed.bytes.byteLength} bytes; room limit is 20 MB`);
-    const chunkSize = 40000;
+    const chunkSize = STATE_CHUNK_BYTES;
     const totalChunks = Math.ceil(packed.bytes.byteLength / chunkSize);
     if (totalChunks > 900) throw new Error(`Compressed savestate needs ${totalChunks} chunks; room limit is 900`);
     const syncId = `${Date.now()}-${Math.random().toString(16).slice(2)}`;
@@ -778,6 +803,7 @@ async function launchEmulator(reason = "manual") {
   state.emulatorStarted = true;
   state.emulatorReady = false;
   state.hostStateRetryCount = 0;
+  state.hostReadySignalSent = false;
   state.hostCheckpointPending = null;
   $("bridgeCoreState").textContent = "LOADING";
   $("bridgeCoreState").className = "amber";
@@ -798,7 +824,7 @@ async function launchEmulator(reason = "manual") {
   window.EJS_startOnLoaded = true;
   window.EJS_DEBUG_XX = true;
   window.EJS_controlScheme = "n64";
-  window.EJS_ready = () => { state.emulatorReady = true; $("bridgeCoreState").textContent = "READY"; $("bridgeCoreState").className = "ready"; $("bridgeBadge").textContent = "CORE READY"; $("bridgeBadge").classList.add("live"); $("emulatorStatus").textContent = "N64 core ready · local frame"; if (state.peerSyncHold && typeof window.EJS_emulator?.pause === "function") { try { window.EJS_emulator.pause(); state.peerSyncPaused = true; } catch (error) { log("peer_sync_hold_error", { message: error.message }, "WARN"); } } log("emulator_ready", { core: EMULATOR_CORE, inputHook: Boolean(getInputHook()), getState: typeof window.EJS_emulator?.gameManager?.getState === "function", loadState: typeof window.EJS_emulator?.gameManager?.loadState === "function", threads: Boolean(window.EJS_threads), crossOriginIsolated: Boolean(window.crossOriginIsolated), vsync: window.EJS_defaultOptions?.vsync, volume: window.EJS_volume }); if (state.self?.slot === 1) { state.room?.send({ type: "host_emulator_ready", romKey: state.romMeta?.romKey, patchProfile: state.romMeta?.patchProfile }); } waitForEmulatorCapabilities(); };
+  window.EJS_ready = () => { state.emulatorReady = true; $("bridgeCoreState").textContent = "READY"; $("bridgeCoreState").className = "ready"; $("bridgeBadge").textContent = "CORE READY"; $("bridgeBadge").classList.add("live"); $("emulatorStatus").textContent = "N64 core ready · local frame"; if (state.peerSyncHold && typeof window.EJS_emulator?.pause === "function") { try { window.EJS_emulator.pause(); state.peerSyncPaused = true; } catch (error) { log("peer_sync_hold_error", { message: error.message }, "WARN"); } } log("emulator_ready", { core: EMULATOR_CORE, inputHook: Boolean(getInputHook()), getState: typeof window.EJS_emulator?.gameManager?.getState === "function", loadState: typeof window.EJS_emulator?.gameManager?.loadState === "function", threads: Boolean(window.EJS_threads), crossOriginIsolated: Boolean(window.crossOriginIsolated), vsync: window.EJS_defaultOptions?.vsync, volume: window.EJS_volume }); waitForEmulatorCapabilities(); };
   window.EJS_onExit = () => { state.emulatorStarted = false; state.emulatorReady = false; $("emulatorStatus").textContent = "Emulator exited"; log("emulator_exit"); };
   if (state.emulatorScript) state.emulatorScript.remove();
   const script = document.createElement("script");
