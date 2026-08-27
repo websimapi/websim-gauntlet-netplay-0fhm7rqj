@@ -352,7 +352,13 @@ async function createLobby() {
 
 async function connectRoom() {
   if (state.room) return state.room;
-  if (!window.WebsimSocket) throw new Error("Realtime room client is unavailable in this preview.");
+  if (!window.WebsimSocket) {
+    if (window.crossOriginIsolated) {
+      log("realtime_runtime_missing", { reason: "coi_reload_removed_websim_socket" }, "ERROR");
+      throw new Error("Realtime is unavailable in the isolated page. Reloading with multiplayer compatibility enabled…");
+    }
+    throw new Error("Realtime room client is unavailable in this preview.");
+  }
   state.room = await window.WebsimSocket.joinRoom();
   setConnection("live", "ROOM CONNECTED");
   $("bridgeInputState").textContent = "READY";
@@ -1085,6 +1091,16 @@ async function boot() {
   bindUI(); setupKeyboard(); startMainThreadMonitor(); window.setInterval(tickClock, 1000);
   let resizeTimer = null;
   window.addEventListener("resize", () => { window.clearTimeout(resizeTimer); resizeTimer = window.setTimeout(refreshEmulatorLayout, 80); }, { passive: true });
+  if (window.crossOriginIsolated && !window.WebsimSocket && sessionStorage.getItem("gauntlet-coi-disabled-for-realtime") !== "1") {
+    log("realtime_compatibility_fallback", { reason: "websim_socket_missing_after_coi_reload" }, "WARN");
+    try {
+      sessionStorage.setItem("gauntlet-coi-disabled-for-realtime", "1");
+      const registration = await navigator.serviceWorker?.getRegistration?.();
+      await registration?.unregister?.();
+    } catch (error) { log("realtime_compatibility_fallback_error", { message: error.message }, "ERROR"); }
+    window.location.reload();
+    return;
+  }
   refreshLobbies();
   await hydrateIdentity();
   log("client_ready", { browser: navigator.userAgent, protocol: "host-authority/1.0", crossOriginIsolated: Boolean(window.crossOriginIsolated), sharedArrayBuffer: typeof window.SharedArrayBuffer === "function", serviceWorkerControlled: Boolean(navigator.serviceWorker?.controller) });
