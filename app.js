@@ -3,9 +3,13 @@
 const EMULATOR_CORE = "mupen64plus_next";
 const INPUT_HEARTBEAT_MS = 33;
 const ANALOG_MAX = 0x7fff;
-const STREAM_CAPTURE_FPS = 60;
-const STREAM_MAX_BITRATE = 2200000;
-const STREAM_AUDIO_MAX_BITRATE = 128000;
+// The host core is single-threaded in the static Websim page. Capturing a
+// second 60fps copy of its canvas can starve that same thread, so use a stable
+// 30fps stream with a modest bitrate. The emulator itself still runs at its
+// normal cadence; this only controls the peer feed.
+const STREAM_CAPTURE_FPS = 30;
+const STREAM_MAX_BITRATE = 1400000;
+const STREAM_AUDIO_MAX_BITRATE = 96000;
 const STREAM_CONFIG = { iceServers: [{ urls: "stun:stun.l.google.com:19302" }], bundlePolicy: "max-bundle", rtcpMuxPolicy: "require" };
 
 const state = {
@@ -45,6 +49,7 @@ const state = {
   mainThreadMonitorTimer: null,
   mainThreadLastWarnAt: 0,
   emulatorPerfTimer: null,
+  emulatorPerfStartTimer: null,
   emulatorPerfLastFrame: null,
   emulatorPerfLastAt: 0,
 };
@@ -836,7 +841,9 @@ async function launchEmulator(reason = "manual") {
     "mupen64plus_next-rdp-plugin": "gliden64",
     "mupen64plus_next-cpucore": "dynamic_recompiler",
     "mupen64plus_next-rsp-plugin": "hle",
-    "mupen64plus_next-43screensize": "640x480",
+    // 640x480 is four times the native N64 pixel count. 320x240 materially
+    // reduces GL work while preserving the 4:3 image and framebuffer effects.
+    "mupen64plus_next-43screensize": "320x240",
     "mupen64plus_next-aspect": "4:3",
     "mupen64plus_next-EnableNativeResFactor": "0",
     "mupen64plus_next-ThreadedRenderer": "False",
@@ -861,7 +868,7 @@ async function launchEmulator(reason = "manual") {
   window.EJS_DEBUG_XX = false;
   window.EJS_controlScheme = "n64";
   window.EJS_onGameStart = () => { log("emulator_game_started", { core: EMULATOR_CORE, threads: Boolean(window.EJS_threads), vsync: window.EJS_defaultOptions?.vsync }); startEmulatorFrameMonitor(); };
-  window.EJS_ready = () => { state.emulatorReady = true; refreshEmulatorLayout(); $("bridgeCoreState").textContent = "READY"; $("bridgeCoreState").className = "ready"; $("bridgeBadge").textContent = "CORE READY"; $("bridgeBadge").classList.add("live"); $("emulatorStatus").textContent = "N64 host core ready"; log("emulator_ready", { core: EMULATOR_CORE, inputHook: Boolean(getInputHook()), getState: typeof window.EJS_emulator?.gameManager?.getState === "function", loadState: typeof window.EJS_emulator?.gameManager?.loadState === "function", threads: Boolean(window.EJS_threads), crossOriginIsolated: Boolean(window.crossOriginIsolated), hardwareConcurrency: navigator.hardwareConcurrency || null, vsync: window.EJS_defaultOptions?.vsync, internalResolution: window.EJS_defaultOptions?.[`${EMULATOR_CORE}-43screensize`], cpuCore: window.EJS_defaultOptions?.[`${EMULATOR_CORE}-cpucore`], rsp: window.EJS_defaultOptions?.[`${EMULATOR_CORE}-rsp-plugin`], nativeHud: window.EJS_defaultOptions?.[`${EMULATOR_CORE}-EnableNativeResTexrects`], volume: window.EJS_volume }); waitForEmulatorCapabilities(); };
+  window.EJS_ready = () => { state.emulatorReady = true; refreshEmulatorLayout(); $("bridgeCoreState").textContent = "READY"; $("bridgeCoreState").className = "ready"; $("bridgeBadge").textContent = "CORE READY"; $("bridgeBadge").classList.add("live"); $("emulatorStatus").textContent = "N64 host core ready"; log("emulator_ready", { core: EMULATOR_CORE, inputHook: Boolean(getInputHook()), getState: typeof window.EJS_emulator?.gameManager?.getState === "function", loadState: typeof window.EJS_emulator?.gameManager?.loadState === "function", threads: Boolean(window.EJS_threads), crossOriginIsolated: Boolean(window.crossOriginIsolated), hardwareConcurrency: navigator.hardwareConcurrency || null, vsync: window.EJS_defaultOptions?.vsync, internalResolution: window.EJS_defaultOptions?.[`${EMULATOR_CORE}-43screensize`], cpuCore: window.EJS_defaultOptions?.[`${EMULATOR_CORE}-cpucore`], rsp: window.EJS_defaultOptions?.[`${EMULATOR_CORE}-rsp-plugin`], nativeHud: window.EJS_defaultOptions?.[`${EMULATOR_CORE}-EnableNativeResTexrects`], streamFps: STREAM_CAPTURE_FPS, streamBitrate: STREAM_MAX_BITRATE, volume: window.EJS_volume }); startEmulatorFrameMonitor(); waitForEmulatorCapabilities(); };
   window.EJS_onExit = () => { state.emulatorStarted = false; state.emulatorReady = false; stopEmulatorFrameMonitor(); if (isHost()) closeAllStreams(); $("emulatorStatus").textContent = "Emulator exited"; log("emulator_exit"); };
   if (state.emulatorScript) state.emulatorScript.remove();
   const script = document.createElement("script");
@@ -886,18 +893,28 @@ function tickClock() { $("emulatorClock").textContent = new Date().toISOString()
 
 function stopEmulatorFrameMonitor() {
   if (state.emulatorPerfTimer) window.clearInterval(state.emulatorPerfTimer);
+  if (state.emulatorPerfStartTimer) window.clearTimeout(state.emulatorPerfStartTimer);
   state.emulatorPerfTimer = null;
+  state.emulatorPerfStartTimer = null;
   state.emulatorPerfLastFrame = null;
   state.emulatorPerfLastAt = 0;
 }
 
-function startEmulatorFrameMonitor() {
-  stopEmulatorFrameMonitor();
-  const getFrameNum = window.EJS_emulator?.gameManager?.getFrameNum;
-  if (typeof getFrameNum !== "function") {
-    log("emulator_frame_rate_unavailable", { reason: "getFrameNum_not_exposed" }, "WARN");
+function startEmulatorFrameMonitor(attempt = 0) {
+  if (state.emulatorPerfTimer || state.emulatorPerfStartTimer) return;
+  const gameManager = window.EJS_emulator?.gameManager;
+  if (typeof gameManager?.getFrameNum !== "function") {
+    if (attempt < 20) {
+      state.emulatorPerfStartTimer = window.setTimeout(() => {
+        state.emulatorPerfStartTimer = null;
+        startEmulatorFrameMonitor(attempt + 1);
+      }, 500);
+    } else {
+      log("emulator_frame_rate_unavailable", { reason: "getFrameNum_not_exposed" }, "WARN");
+    }
     return;
   }
+  const getFrameNum = () => gameManager.getFrameNum();
   try { state.emulatorPerfLastFrame = Number(getFrameNum()); } catch { state.emulatorPerfLastFrame = 0; }
   state.emulatorPerfLastAt = performance.now();
   state.emulatorPerfTimer = window.setInterval(() => {
@@ -910,7 +927,7 @@ function startEmulatorFrameMonitor() {
     state.emulatorPerfLastFrame = frame;
     state.emulatorPerfLastAt = now;
     log("emulator_frame_rate", { fps: Math.round(fps * 10) / 10, frameDelta, elapsedMs: Math.round(elapsedMs), vsync: window.EJS_defaultOptions?.vsync }, fps < 50 ? "WARN" : "INFO");
-  }, 2000);
+  }, 5000);
 }
 
 function startMainThreadMonitor() {
