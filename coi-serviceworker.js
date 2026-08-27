@@ -44,13 +44,6 @@ if (typeof window === "undefined") {
   (() => {
     const navigation = navigator.serviceWorker;
     if (!navigation || window.crossOriginIsolated !== false || !window.isSecureContext) return;
-    // Websim injects WebsimSocket from the host-authority context. If a
-    // previous isolated reload proved that integration unavailable, stay
-    // disabled for this tab so realtime multiplayer can recover cleanly.
-    if (sessionStorage.getItem("gauntlet-coi-disabled-for-realtime") === "1") {
-      navigation.controller?.postMessage({ type: "deregister" });
-      return;
-    }
 
     navigation.register(document.currentScript.src).then((registration) => navigator.serviceWorker.ready.then((readyRegistration) => {
       const controller = navigation.controller || readyRegistration.active || registration.active;
