@@ -35,6 +35,9 @@ const state = {
   emulatorScript: null,
   hostReadySignalSent: false,
   hostStream: null,
+  hostAudioMixer: null,
+  hostAudioDestination: null,
+  hostAudioCaptureMode: "none",
   hostStreamPeers: new Map(),
   hostStreamOfferPromises: new Map(),
   remoteStreamConnection: null,
@@ -240,7 +243,7 @@ function buildReport() {
     rom: state.romMeta ? { ...state.romMeta } : null,
     connection: { lobby: state.lobby?.id || null, self: state.self, players: state.players.map(({ id, username, slot, seq }) => ({ id, username, slot, seq })), lastAck: state.lastAck },
     emulator: { core: EMULATOR_CORE, started: state.emulatorStarted, ready: state.emulatorReady, hostReadySignalSent: state.hostReadySignalSent, EJS: Boolean(window.EJS_emulator), gameManager: Boolean(window.EJS_emulator?.gameManager), simulateInput: typeof window.EJS_emulator?.gameManager?.simulateInput === "function", globalSimulateInput: typeof window.simulate_input === "function", inputHook: Boolean(getInputHook()), getState: typeof window.EJS_emulator?.gameManager?.getState === "function", loadState: typeof window.EJS_emulator?.gameManager?.loadState === "function", compressionStream: typeof CompressionStream === "function", decompressionStream: typeof DecompressionStream === "function", crossOriginIsolated: Boolean(window.crossOriginIsolated), threads: Boolean(window.EJS_threads), volume: window.EJS_volume ?? null },
-    stream: { hostTracks: state.hostStream?.getTracks().map((track) => ({ kind: track.kind, state: track.readyState })) || [], peerConnections: state.hostStreamPeers.size, receiving: Boolean(state.remoteStreamConnection), remoteVideo: Boolean($("remoteGame")?.srcObject) },
+    stream: { hostTracks: state.hostStream?.getTracks().map((track) => ({ kind: track.kind, state: track.readyState })) || [], audioCapture: state.hostAudioCaptureMode, peerConnections: state.hostStreamPeers.size, receiving: Boolean(state.remoteStreamConnection), remoteVideo: Boolean($("remoteGame")?.srcObject) },
     protocol: { name: "host-authority/1.0", serverTickMs: 50, inputSendMs: INPUT_HEARTBEAT_MS, videoTransport: "WebRTC", inputSequence: state.seq, currentInput: state.input },
     recentLogs: state.logs.slice(-80),
   }, null, 2);
@@ -384,9 +387,18 @@ function closeAllStreams() {
   state.remoteAppliedInputSeq.clear();
   state.remoteInputState.clear();
   state.localInputState = null;
+  releaseHostMediaCapture();
+  closeRemoteStream();
+}
+
+function releaseHostMediaCapture() {
   if (state.hostStream) state.hostStream.getTracks().forEach((track) => track.stop());
   state.hostStream = null;
-  closeRemoteStream();
+  try { state.hostAudioMixer?.disconnect(); } catch {}
+  try { state.hostAudioDestination?.disconnect?.(); } catch {}
+  state.hostAudioMixer = null;
+  state.hostAudioDestination = null;
+  state.hostAudioCaptureMode = "none";
 }
 
 function scheduleHostStreams(delayMs = 120) {
@@ -403,23 +415,60 @@ function announceHostReady() {
 }
 
 function captureHostMedia(canvas) {
-  // EmulatorJS already knows how to route its WebAudio sources into a
-  // MediaStream. Use that path for peers when this runtime exposes it.
+  const stream = canvas.captureStream(STREAM_CAPTURE_FPS);
+  stream.getVideoTracks().forEach((track) => { track.contentHint = "motion"; });
+
+  // EmulatorJS's built-in capture helper creates a channel-merger with one
+  // output channel per OpenAL source. Gauntlet can have many sources active;
+  // that unnecessarily creates a multichannel WebAudio graph and makes the
+  // main thread compete with the core. Mix those sources into one normal
+  // stereo destination instead, preserving peer audio with less graph work.
   try {
-    const capture = window.EJS_emulator?.collectScreenRecordingMediaTracks;
-    if (typeof capture === "function") {
-      const stream = capture.call(window.EJS_emulator, canvas, STREAM_CAPTURE_FPS);
-      if (stream?.getVideoTracks?.().length) {
-        stream.getVideoTracks().forEach((track) => { track.contentHint = "motion"; });
-        stream.getAudioTracks().forEach((track) => { track.contentHint = "music"; });
+    const audioContext = window.EJS_emulator?.Module?.AL?.currentCtx?.audioCtx;
+    const sources = window.EJS_emulator?.Module?.AL?.currentCtx?.sources || {};
+    const gainNodes = Object.values(sources).map((source) => source?.gain).filter((gain) => gain && typeof gain.connect === "function");
+    if (audioContext && gainNodes.length && typeof audioContext.createGain === "function" && typeof audioContext.createMediaStreamDestination === "function") {
+      const mixer = audioContext.createGain();
+      mixer.gain.value = 1;
+      mixer.channelCount = 2;
+      mixer.channelCountMode = "max";
+      const destination = audioContext.createMediaStreamDestination();
+      gainNodes.forEach((gain) => gain.connect(mixer));
+      mixer.connect(destination);
+      const audioTrack = destination.stream.getAudioTracks()[0];
+      if (audioTrack?.readyState === "live") {
+        audioTrack.contentHint = "music";
+        stream.addTrack(audioTrack);
+        state.hostAudioMixer = mixer;
+        state.hostAudioDestination = destination;
+        state.hostAudioCaptureMode = "optimized-mix";
+        log("host_audio_capture_mix", { sourceCount: gainNodes.length, channels: 2, mode: "summed_gain_nodes" });
         return stream;
       }
     }
   } catch (error) {
-    log("host_media_audio_capture_fallback", { message: error.message }, "WARN");
+    log("host_audio_capture_mix_failed", { message: error.message }, "WARN");
   }
-  const stream = canvas.captureStream(STREAM_CAPTURE_FPS);
-  stream.getVideoTracks().forEach((track) => { track.contentHint = "motion"; });
+
+  // Keep a compatibility fallback for EmulatorJS releases that do not expose
+  // OpenAL's source graph. This is only used when the optimized mixer cannot
+  // be constructed.
+  try {
+    const capture = window.EJS_emulator?.collectScreenRecordingMediaTracks;
+    if (typeof capture === "function") {
+      const captured = capture.call(window.EJS_emulator, canvas, STREAM_CAPTURE_FPS);
+      const audioTrack = captured?.getAudioTracks?.()[0];
+      // We already own the primary canvas video track above; do not leave the
+      // fallback helper's duplicate video capture running in the background.
+      captured?.getVideoTracks?.().forEach((track) => track.stop());
+      if (audioTrack?.readyState === "live") {
+        audioTrack.contentHint = "music";
+        stream.addTrack(audioTrack);
+        state.hostAudioCaptureMode = "emulatorjs-fallback";
+        log("host_audio_capture_fallback", { mode: "emulatorjs_capture" }, "WARN");
+      }
+    }
+  } catch (error) { log("host_audio_capture_fallback_failed", { message: error.message }, "WARN"); }
   return stream;
 }
 
@@ -437,8 +486,7 @@ async function ensureHostStreams() {
   const peers = state.players.filter((player) => player.id !== state.self?.id);
   for (const peerId of state.hostStreamPeers.keys()) if (!peers.some((player) => player.id === peerId)) closeHostStreamPeer(peerId);
   if (!peers.length) {
-    if (state.hostStream) state.hostStream.getTracks().forEach((track) => track.stop());
-    state.hostStream = null;
+    releaseHostMediaCapture();
     return;
   }
   const canvas = $("game")?.querySelector("canvas");
@@ -852,6 +900,13 @@ async function launchEmulator(reason = "manual") {
     // while avoiding the slower unoptimized 2D path.
     "mupen64plus_next-EnableNativeResTexrects": "Optimized",
     "mupen64plus_next-BilinearMode": "3point",
+    // The hybrid integer filter is enabled by default in some GLideN64
+    // builds and can be expensive on a browser GPU. The native 320x240
+    // output does not need it.
+    "mupen64plus_next-HybridFilter": "False",
+    // Per-pixel texture LOD is useful for texture packs, not this native
+    // resolution ROM, and adds shader work during the 3D scenes.
+    "mupen64plus_next-EnableLODEmulation": "False",
     "mupen64plus_next-EnableLegacyBlending": "False",
     "mupen64plus_next-Framerate": "Original",
     "mupen64plus_next-MultiSampling": "0",
