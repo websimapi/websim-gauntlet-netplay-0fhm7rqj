@@ -41,6 +41,9 @@ const state = {
   hostStreamRequestTimer: null,
   hostStreamTimer: null,
   playerLayoutKey: "",
+  logRenderTimer: null,
+  mainThreadMonitorTimer: null,
+  mainThreadLastWarnAt: 0,
 };
 
 const $ = (id) => document.getElementById(id);
@@ -54,9 +57,16 @@ function log(event, detail = {}, level = "INFO") {
   const line = `[${nowStamp()}] ${level.padEnd(5)} ${event} ${Object.keys(detail).length ? JSON.stringify(detail) : ""}`.trimEnd();
   state.logs.push(line);
   if (state.logs.length > 250) state.logs.shift();
-  logOutput.textContent = state.logs.join("\n");
-  logOutput.scrollTop = logOutput.scrollHeight;
-  $("logCount").textContent = `${state.logs.length} EVENTS`;
+  // Log collection must not compete with the emulator for the main thread.
+  // Batch the visible console updates; state.logs remains complete in memory.
+  if (!state.logRenderTimer) {
+    state.logRenderTimer = window.setTimeout(() => {
+      state.logRenderTimer = null;
+      logOutput.textContent = state.logs.join("\n");
+      logOutput.scrollTop = logOutput.scrollHeight;
+      $("logCount").textContent = `${state.logs.length} EVENTS`;
+    }, 100);
+  }
 }
 
 function toast(message) {
@@ -823,8 +833,15 @@ async function launchEmulator(reason = "manual") {
     "mupen64plus_next-rsp-plugin": "hle",
     "mupen64plus_next-43screensize": "640x480",
     "mupen64plus_next-aspect": "4:3",
-    "mupen64plus_next-EnableNativeResFactor": "False",
+    "mupen64plus_next-EnableNativeResFactor": "0",
     "mupen64plus_next-ThreadedRenderer": "False",
+    // Gauntlet's HUD is composed of native-resolution texrects. The
+    // optimized path prevents the player panels from being split or clipped
+    // while avoiding the slower unoptimized 2D path.
+    "mupen64plus_next-EnableNativeResTexrects": "Optimized",
+    "mupen64plus_next-BilinearMode": "3point",
+    "mupen64plus_next-EnableLegacyBlending": "False",
+    "mupen64plus_next-Framerate": "Original",
     "mupen64plus_next-MultiSampling": "0",
     "mupen64plus_next-FXAA": "0",
     "mupen64plus_next-EnableFBEmulation": "True",
@@ -838,7 +855,8 @@ async function launchEmulator(reason = "manual") {
   window.EJS_startOnLoaded = true;
   window.EJS_DEBUG_XX = false;
   window.EJS_controlScheme = "n64";
-  window.EJS_ready = () => { state.emulatorReady = true; refreshEmulatorLayout(); $("bridgeCoreState").textContent = "READY"; $("bridgeCoreState").className = "ready"; $("bridgeBadge").textContent = "CORE READY"; $("bridgeBadge").classList.add("live"); $("emulatorStatus").textContent = "N64 host core ready"; log("emulator_ready", { core: EMULATOR_CORE, inputHook: Boolean(getInputHook()), getState: typeof window.EJS_emulator?.gameManager?.getState === "function", loadState: typeof window.EJS_emulator?.gameManager?.loadState === "function", threads: Boolean(window.EJS_threads), crossOriginIsolated: Boolean(window.crossOriginIsolated), hardwareConcurrency: navigator.hardwareConcurrency || null, vsync: window.EJS_defaultOptions?.vsync, volume: window.EJS_volume }); waitForEmulatorCapabilities(); };
+  window.EJS_onGameStart = () => log("emulator_game_started", { core: EMULATOR_CORE, threads: Boolean(window.EJS_threads), vsync: window.EJS_defaultOptions?.vsync });
+  window.EJS_ready = () => { state.emulatorReady = true; refreshEmulatorLayout(); $("bridgeCoreState").textContent = "READY"; $("bridgeCoreState").className = "ready"; $("bridgeBadge").textContent = "CORE READY"; $("bridgeBadge").classList.add("live"); $("emulatorStatus").textContent = "N64 host core ready"; log("emulator_ready", { core: EMULATOR_CORE, inputHook: Boolean(getInputHook()), getState: typeof window.EJS_emulator?.gameManager?.getState === "function", loadState: typeof window.EJS_emulator?.gameManager?.loadState === "function", threads: Boolean(window.EJS_threads), crossOriginIsolated: Boolean(window.crossOriginIsolated), hardwareConcurrency: navigator.hardwareConcurrency || null, vsync: window.EJS_defaultOptions?.vsync, internalResolution: window.EJS_defaultOptions?.[`${EMULATOR_CORE}-43screensize`], cpuCore: window.EJS_defaultOptions?.[`${EMULATOR_CORE}-cpucore`], rsp: window.EJS_defaultOptions?.[`${EMULATOR_CORE}-rsp-plugin`], nativeHud: window.EJS_defaultOptions?.[`${EMULATOR_CORE}-EnableNativeResTexrects`], volume: window.EJS_volume }); waitForEmulatorCapabilities(); };
   window.EJS_onExit = () => { state.emulatorStarted = false; state.emulatorReady = false; if (isHost()) closeAllStreams(); $("emulatorStatus").textContent = "Emulator exited"; log("emulator_exit"); };
   if (state.emulatorScript) state.emulatorScript.remove();
   const script = document.createElement("script");
@@ -861,6 +879,19 @@ async function leaveLobby() {
 
 function tickClock() { $("emulatorClock").textContent = new Date().toISOString().slice(11, 19); }
 
+function startMainThreadMonitor() {
+  if (state.mainThreadMonitorTimer) window.clearInterval(state.mainThreadMonitorTimer);
+  let expected = performance.now() + 1000;
+  state.mainThreadMonitorTimer = window.setInterval(() => {
+    const now = performance.now();
+    const driftMs = Math.max(0, Math.round(now - expected));
+    expected = now + 1000;
+    if (driftMs < 250 || now - state.mainThreadLastWarnAt < 5000) return;
+    state.mainThreadLastWarnAt = now;
+    log("main_thread_stall", { driftMs, hidden: document.hidden, emulatorReady: state.emulatorReady, threads: Boolean(window.EJS_threads) }, "WARN");
+  }, 1000);
+}
+
 function bindUI() {
   $("romInput").addEventListener("change", (event) => handleRom(event.target.files[0]));
   const dropZone = $("dropZone");
@@ -881,7 +912,7 @@ function bindUI() {
 }
 
 async function boot() {
-  bindUI(); setupKeyboard(); window.setInterval(tickClock, 1000);
+  bindUI(); setupKeyboard(); startMainThreadMonitor(); window.setInterval(tickClock, 1000);
   let resizeTimer = null;
   window.addEventListener("resize", () => { window.clearTimeout(resizeTimer); resizeTimer = window.setTimeout(refreshEmulatorLayout, 80); }, { passive: true });
   refreshLobbies();
