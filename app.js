@@ -14,6 +14,7 @@ const STREAM_CAPTURE_FPS = 30;
 const STREAM_MAX_BITRATE = 1400000;
 const STREAM_AUDIO_MAX_BITRATE = 96000;
 const STREAM_CONFIG = { iceServers: [{ urls: "stun:stun.l.google.com:19302" }], bundlePolicy: "max-bundle", rtcpMuxPolicy: "require" };
+const IDENTITY_HINT_KEY = "gauntlet-netplay-identity";
 
 const state = {
   user: null,
@@ -89,6 +90,48 @@ function toast(message) {
   node.classList.add("show");
   window.clearTimeout(toast.timer);
   toast.timer = window.setTimeout(() => node.classList.remove("show"), 2300);
+}
+
+function readIdentityHint() {
+  try {
+    const parsed = JSON.parse(sessionStorage.getItem(IDENTITY_HINT_KEY) || "null");
+    return parsed && typeof parsed.id === "string" && typeof parsed.username === "string" ? parsed : null;
+  } catch { return null; }
+}
+
+function rememberIdentity(user) {
+  if (!user?.id || !user?.username) return;
+  try { sessionStorage.setItem(IDENTITY_HINT_KEY, JSON.stringify({ id: user.id, username: user.username })); } catch {}
+}
+
+async function hydrateIdentity() {
+  const getUser = window.websim?.getUser;
+  let lastError = null;
+  if (typeof getUser === "function") {
+    // The COI service-worker reload can race the host identity bridge. Give it
+    // a few short chances before falling back to the session hint.
+    for (const waitMs of [0, 150, 500, 1000]) {
+      if (waitMs) await new Promise((resolve) => window.setTimeout(resolve, waitMs));
+      try {
+        const user = await getUser.call(window.websim);
+        if (user?.id) {
+          state.user = user;
+          rememberIdentity(user);
+          log("identity_loaded", { signedIn: true, username: user.username || null, attemptWaitMs: waitMs });
+          return user;
+        }
+      } catch (error) { lastError = error; }
+    }
+  }
+  const hint = readIdentityHint();
+  if (hint) {
+    state.user = hint;
+    log("identity_restored", { signedIn: true, username: hint.username, source: "session_after_coi_reload" }, "WARN");
+    return hint;
+  }
+  if (lastError) log("identity_error", { message: lastError.message }, "WARN");
+  else log("identity_loaded", { signedIn: false, username: null });
+  return null;
 }
 
 async function copyText(value, success = "Copied to clipboard") {
@@ -291,7 +334,10 @@ async function refreshLobbies() {
 }
 
 async function createLobby() {
-  if (!state.user) { toast("Sign in to create a lobby"); log("lobby_create_blocked", { reason: "signed_out" }, "WARN"); return; }
+  // The backend and realtime room perform the authoritative identity check.
+  // Do not block an authenticated Websim session just because getUser() was
+  // delayed by the cross-origin-isolation reload.
+  if (!state.user) log("identity_unverified_attempt", { action: "create_lobby" }, "WARN");
   if (!state.romMeta?.valid) { toast("Load a valid Gauntlet ROM first"); log("lobby_create_blocked", { reason: "valid_rom_required" }, "WARN"); return; }
   try {
     const response = await fetch("/api/lobbies", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ visibility: state.selectedVisibility }) });
@@ -331,14 +377,22 @@ async function connectRoom() {
       log("join_lobby_replay_blocked", { reason: "valid_rom_required" }, "WARN");
     }
   };
-  state.room.onclose = (event) => { log("room_closed", { code: event.code, reason: event.reason }, "WARN"); closeAllStreams(); setConnection("error", "ROOM CLOSED"); state.room = null; state.self = null; };
+  state.room.onclose = (event) => {
+    const reason = String(event.reason || "");
+    log("room_closed", { code: event.code, reason, signedIn: Boolean(state.user) }, "WARN");
+    closeAllStreams();
+    setConnection("error", event.code === 4001 ? "AUTH REJECTED" : "ROOM CLOSED");
+    state.room = null;
+    state.self = null;
+    if (event.code === 4001) toast(reason || "Realtime authentication was rejected. Reload and try again.");
+  };
   return state.room;
 }
 
 async function joinLobby(code) {
   const lobbyId = String(code || $("lobbyCodeInput").value).trim().toUpperCase();
   if (!lobbyId) { toast("Enter a lobby code"); return; }
-  if (!state.user) { toast("Sign in to join a lobby"); log("lobby_join_blocked", { reason: "signed_out", lobbyId }, "WARN"); return; }
+  if (!state.user) log("identity_unverified_attempt", { action: "join_lobby", lobbyId }, "WARN");
   if (!state.romMeta?.valid) { toast("Load a valid Gauntlet ROM first"); log("lobby_join_blocked", { reason: "valid_rom_required", lobbyId }, "WARN"); return; }
   try {
     const room = await connectRoom();
@@ -1032,8 +1086,7 @@ async function boot() {
   let resizeTimer = null;
   window.addEventListener("resize", () => { window.clearTimeout(resizeTimer); resizeTimer = window.setTimeout(refreshEmulatorLayout, 80); }, { passive: true });
   refreshLobbies();
-  try { state.user = await window.websim?.getUser?.(); log("identity_loaded", { signedIn: Boolean(state.user), username: state.user?.username || null }); }
-  catch (error) { log("identity_error", { message: error.message }, "WARN"); }
+  await hydrateIdentity();
   log("client_ready", { browser: navigator.userAgent, protocol: "host-authority/1.0", crossOriginIsolated: Boolean(window.crossOriginIsolated), sharedArrayBuffer: typeof window.SharedArrayBuffer === "function", serviceWorkerControlled: Boolean(navigator.serviceWorker?.controller) });
 }
 
