@@ -44,6 +44,9 @@ const state = {
   logRenderTimer: null,
   mainThreadMonitorTimer: null,
   mainThreadLastWarnAt: 0,
+  emulatorPerfTimer: null,
+  emulatorPerfLastFrame: null,
+  emulatorPerfLastAt: 0,
 };
 
 const $ = (id) => document.getElementById(id);
@@ -791,6 +794,7 @@ async function launchEmulator(reason = "manual") {
     return;
   }
   if (isHost()) closeAllStreams();
+  stopEmulatorFrameMonitor();
   if (typeof window.EJS_terminate === "function") { try { window.EJS_terminate(); } catch {} }
   if (state.romUrl) URL.revokeObjectURL(state.romUrl);
   state.romUrl = URL.createObjectURL(state.romLaunchBlob || state.rom);
@@ -820,9 +824,10 @@ async function launchEmulator(reason = "manual") {
   window.EJS_forceLegacyCores = false;
   window.EJS_defaultOptions = {
     ...(window.EJS_defaultOptions || {}),
-    // Keep the core clock independent from a throttled browser compositor.
-    // The host is authoritative, so its emulation clock must stay real-time.
-    vsync: "disabled",
+    // Keep the core synchronized to the browser's display/audio cadence.
+    // With this WebAssembly/RetroArch path, disabling VSync can present at
+    // an apparent half-rate even while the internal frame counter advances.
+    vsync: "enabled",
     fastForward: "disabled",
     slowMotion: "disabled",
     shader: "disabled",
@@ -855,9 +860,9 @@ async function launchEmulator(reason = "manual") {
   window.EJS_startOnLoaded = true;
   window.EJS_DEBUG_XX = false;
   window.EJS_controlScheme = "n64";
-  window.EJS_onGameStart = () => log("emulator_game_started", { core: EMULATOR_CORE, threads: Boolean(window.EJS_threads), vsync: window.EJS_defaultOptions?.vsync });
+  window.EJS_onGameStart = () => { log("emulator_game_started", { core: EMULATOR_CORE, threads: Boolean(window.EJS_threads), vsync: window.EJS_defaultOptions?.vsync }); startEmulatorFrameMonitor(); };
   window.EJS_ready = () => { state.emulatorReady = true; refreshEmulatorLayout(); $("bridgeCoreState").textContent = "READY"; $("bridgeCoreState").className = "ready"; $("bridgeBadge").textContent = "CORE READY"; $("bridgeBadge").classList.add("live"); $("emulatorStatus").textContent = "N64 host core ready"; log("emulator_ready", { core: EMULATOR_CORE, inputHook: Boolean(getInputHook()), getState: typeof window.EJS_emulator?.gameManager?.getState === "function", loadState: typeof window.EJS_emulator?.gameManager?.loadState === "function", threads: Boolean(window.EJS_threads), crossOriginIsolated: Boolean(window.crossOriginIsolated), hardwareConcurrency: navigator.hardwareConcurrency || null, vsync: window.EJS_defaultOptions?.vsync, internalResolution: window.EJS_defaultOptions?.[`${EMULATOR_CORE}-43screensize`], cpuCore: window.EJS_defaultOptions?.[`${EMULATOR_CORE}-cpucore`], rsp: window.EJS_defaultOptions?.[`${EMULATOR_CORE}-rsp-plugin`], nativeHud: window.EJS_defaultOptions?.[`${EMULATOR_CORE}-EnableNativeResTexrects`], volume: window.EJS_volume }); waitForEmulatorCapabilities(); };
-  window.EJS_onExit = () => { state.emulatorStarted = false; state.emulatorReady = false; if (isHost()) closeAllStreams(); $("emulatorStatus").textContent = "Emulator exited"; log("emulator_exit"); };
+  window.EJS_onExit = () => { state.emulatorStarted = false; state.emulatorReady = false; stopEmulatorFrameMonitor(); if (isHost()) closeAllStreams(); $("emulatorStatus").textContent = "Emulator exited"; log("emulator_exit"); };
   if (state.emulatorScript) state.emulatorScript.remove();
   const script = document.createElement("script");
   script.src = `https://cdn.emulatorjs.org/stable/data/loader.js?bridge=${Date.now()}`;
@@ -878,6 +883,35 @@ async function leaveLobby() {
 }
 
 function tickClock() { $("emulatorClock").textContent = new Date().toISOString().slice(11, 19); }
+
+function stopEmulatorFrameMonitor() {
+  if (state.emulatorPerfTimer) window.clearInterval(state.emulatorPerfTimer);
+  state.emulatorPerfTimer = null;
+  state.emulatorPerfLastFrame = null;
+  state.emulatorPerfLastAt = 0;
+}
+
+function startEmulatorFrameMonitor() {
+  stopEmulatorFrameMonitor();
+  const getFrameNum = window.EJS_emulator?.gameManager?.getFrameNum;
+  if (typeof getFrameNum !== "function") {
+    log("emulator_frame_rate_unavailable", { reason: "getFrameNum_not_exposed" }, "WARN");
+    return;
+  }
+  try { state.emulatorPerfLastFrame = Number(getFrameNum()); } catch { state.emulatorPerfLastFrame = 0; }
+  state.emulatorPerfLastAt = performance.now();
+  state.emulatorPerfTimer = window.setInterval(() => {
+    const now = performance.now();
+    let frame;
+    try { frame = Number(getFrameNum()); } catch { return; }
+    const elapsedMs = now - state.emulatorPerfLastAt;
+    const frameDelta = frame - state.emulatorPerfLastFrame;
+    const fps = elapsedMs > 0 ? frameDelta * 1000 / elapsedMs : 0;
+    state.emulatorPerfLastFrame = frame;
+    state.emulatorPerfLastAt = now;
+    log("emulator_frame_rate", { fps: Math.round(fps * 10) / 10, frameDelta, elapsedMs: Math.round(elapsedMs), vsync: window.EJS_defaultOptions?.vsync }, fps < 50 ? "WARN" : "INFO");
+  }, 2000);
+}
 
 function startMainThreadMonitor() {
   if (state.mainThreadMonitorTimer) window.clearInterval(state.mainThreadMonitorTimer);
