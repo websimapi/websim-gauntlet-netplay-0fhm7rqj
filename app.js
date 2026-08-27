@@ -3,6 +3,9 @@
 const EMULATOR_CORE = "mupen64plus_next";
 const INPUT_HEARTBEAT_MS = 33;
 const ANALOG_MAX = 0x7fff;
+// GLideN64 documents legacy blending as a faster path for slow GPUs. Keep
+// this explicit so performance logs and support reports identify the tradeoff.
+const FAST_RENDER_PROFILE = true;
 // The host core is single-threaded in the static Websim page. Capturing a
 // second 60fps copy of its canvas can starve that same thread, so use a stable
 // 30fps stream with a modest bitrate. The emulator itself still runs at its
@@ -242,7 +245,7 @@ function buildReport() {
     viewport: `${window.innerWidth}x${window.innerHeight}`,
     rom: state.romMeta ? { ...state.romMeta } : null,
     connection: { lobby: state.lobby?.id || null, self: state.self, players: state.players.map(({ id, username, slot, seq }) => ({ id, username, slot, seq })), lastAck: state.lastAck },
-    emulator: { core: EMULATOR_CORE, started: state.emulatorStarted, ready: state.emulatorReady, hostReadySignalSent: state.hostReadySignalSent, EJS: Boolean(window.EJS_emulator), gameManager: Boolean(window.EJS_emulator?.gameManager), simulateInput: typeof window.EJS_emulator?.gameManager?.simulateInput === "function", globalSimulateInput: typeof window.simulate_input === "function", inputHook: Boolean(getInputHook()), getState: typeof window.EJS_emulator?.gameManager?.getState === "function", loadState: typeof window.EJS_emulator?.gameManager?.loadState === "function", compressionStream: typeof CompressionStream === "function", decompressionStream: typeof DecompressionStream === "function", crossOriginIsolated: Boolean(window.crossOriginIsolated), threads: Boolean(window.EJS_threads), volume: window.EJS_volume ?? null },
+    emulator: { core: EMULATOR_CORE, renderProfile: FAST_RENDER_PROFILE ? "legacy-blending" : "compatibility", started: state.emulatorStarted, ready: state.emulatorReady, hostReadySignalSent: state.hostReadySignalSent, EJS: Boolean(window.EJS_emulator), gameManager: Boolean(window.EJS_emulator?.gameManager), simulateInput: typeof window.EJS_emulator?.gameManager?.simulateInput === "function", globalSimulateInput: typeof window.simulate_input === "function", inputHook: Boolean(getInputHook()), getState: typeof window.EJS_emulator?.gameManager?.getState === "function", loadState: typeof window.EJS_emulator?.gameManager?.loadState === "function", compressionStream: typeof CompressionStream === "function", decompressionStream: typeof DecompressionStream === "function", crossOriginIsolated: Boolean(window.crossOriginIsolated), threads: Boolean(window.EJS_threads), volume: window.EJS_volume ?? null },
     stream: { hostTracks: state.hostStream?.getTracks().map((track) => ({ kind: track.kind, state: track.readyState })) || [], audioCapture: state.hostAudioCaptureMode, peerConnections: state.hostStreamPeers.size, receiving: Boolean(state.remoteStreamConnection), remoteVideo: Boolean($("remoteGame")?.srcObject) },
     protocol: { name: "host-authority/1.0", serverTickMs: 50, inputSendMs: INPUT_HEARTBEAT_MS, videoTransport: "WebRTC", inputSequence: state.seq, currentInput: state.input },
     recentLogs: state.logs.slice(-80),
@@ -894,7 +897,10 @@ async function launchEmulator(reason = "manual") {
     "mupen64plus_next-43screensize": "320x240",
     "mupen64plus_next-aspect": "4:3",
     "mupen64plus_next-EnableNativeResFactor": "0",
-    "mupen64plus_next-ThreadedRenderer": "False",
+    // Use the threaded renderer only when the core can actually create
+    // pthread workers. The stable CDN build is single-threaded on Websim
+    // because crossOriginIsolated is currently false.
+    "mupen64plus_next-ThreadedRenderer": window.EJS_threads ? "True" : "False",
     // Gauntlet's HUD is composed of native-resolution texrects. The
     // optimized path prevents the player panels from being split or clipped
     // while avoiding the slower unoptimized 2D path.
@@ -907,7 +913,11 @@ async function launchEmulator(reason = "manual") {
     // Per-pixel texture LOD is useful for texture packs, not this native
     // resolution ROM, and adds shader work during the 3D scenes.
     "mupen64plus_next-EnableLODEmulation": "False",
-    "mupen64plus_next-EnableLegacyBlending": "False",
+    // GLideN64's legacy blend path avoids shader-based N64 blend emulation.
+    // It is explicitly documented as faster on slow GPUs, with some visual
+    // accuracy tradeoffs; framebuffer emulation and the native HUD path stay
+    // enabled because Gauntlet relies on them.
+    "mupen64plus_next-EnableLegacyBlending": FAST_RENDER_PROFILE ? "True" : "False",
     "mupen64plus_next-Framerate": "Original",
     "mupen64plus_next-MultiSampling": "0",
     "mupen64plus_next-FXAA": "0",
@@ -922,8 +932,8 @@ async function launchEmulator(reason = "manual") {
   window.EJS_startOnLoaded = true;
   window.EJS_DEBUG_XX = false;
   window.EJS_controlScheme = "n64";
-  window.EJS_onGameStart = () => { log("emulator_game_started", { core: EMULATOR_CORE, threads: Boolean(window.EJS_threads), vsync: window.EJS_defaultOptions?.vsync }); startEmulatorFrameMonitor(); };
-  window.EJS_ready = () => { state.emulatorReady = true; refreshEmulatorLayout(); $("bridgeCoreState").textContent = "READY"; $("bridgeCoreState").className = "ready"; $("bridgeBadge").textContent = "CORE READY"; $("bridgeBadge").classList.add("live"); $("emulatorStatus").textContent = "N64 host core ready"; log("emulator_ready", { core: EMULATOR_CORE, inputHook: Boolean(getInputHook()), getState: typeof window.EJS_emulator?.gameManager?.getState === "function", loadState: typeof window.EJS_emulator?.gameManager?.loadState === "function", threads: Boolean(window.EJS_threads), crossOriginIsolated: Boolean(window.crossOriginIsolated), hardwareConcurrency: navigator.hardwareConcurrency || null, vsync: window.EJS_defaultOptions?.vsync, internalResolution: window.EJS_defaultOptions?.[`${EMULATOR_CORE}-43screensize`], cpuCore: window.EJS_defaultOptions?.[`${EMULATOR_CORE}-cpucore`], rsp: window.EJS_defaultOptions?.[`${EMULATOR_CORE}-rsp-plugin`], nativeHud: window.EJS_defaultOptions?.[`${EMULATOR_CORE}-EnableNativeResTexrects`], streamFps: STREAM_CAPTURE_FPS, streamBitrate: STREAM_MAX_BITRATE, volume: window.EJS_volume }); startEmulatorFrameMonitor(); waitForEmulatorCapabilities(); };
+  window.EJS_onGameStart = () => { log("emulator_game_started", { core: EMULATOR_CORE, threads: Boolean(window.EJS_threads), vsync: window.EJS_defaultOptions?.vsync, renderProfile: FAST_RENDER_PROFILE ? "legacy-blending" : "compatibility" }); startEmulatorFrameMonitor(); };
+  window.EJS_ready = () => { state.emulatorReady = true; refreshEmulatorLayout(); $("bridgeCoreState").textContent = "READY"; $("bridgeCoreState").className = "ready"; $("bridgeBadge").textContent = "CORE READY"; $("bridgeBadge").classList.add("live"); $("emulatorStatus").textContent = "N64 host core ready"; log("emulator_ready", { core: EMULATOR_CORE, inputHook: Boolean(getInputHook()), getState: typeof window.EJS_emulator?.gameManager?.getState === "function", loadState: typeof window.EJS_emulator?.gameManager?.loadState === "function", threads: Boolean(window.EJS_threads), crossOriginIsolated: Boolean(window.crossOriginIsolated), hardwareConcurrency: navigator.hardwareConcurrency || null, vsync: window.EJS_defaultOptions?.vsync, internalResolution: window.EJS_defaultOptions?.[`${EMULATOR_CORE}-43screensize`], cpuCore: window.EJS_defaultOptions?.[`${EMULATOR_CORE}-cpucore`], rsp: window.EJS_defaultOptions?.[`${EMULATOR_CORE}-rsp-plugin`], nativeHud: window.EJS_defaultOptions?.[`${EMULATOR_CORE}-EnableNativeResTexrects`], legacyBlending: window.EJS_defaultOptions?.[`${EMULATOR_CORE}-EnableLegacyBlending`], framebufferEmulation: window.EJS_defaultOptions?.[`${EMULATOR_CORE}-EnableFBEmulation`], streamFps: STREAM_CAPTURE_FPS, streamBitrate: STREAM_MAX_BITRATE, volume: window.EJS_volume, renderProfile: FAST_RENDER_PROFILE ? "legacy-blending" : "compatibility" }); startEmulatorFrameMonitor(); waitForEmulatorCapabilities(); };
   window.EJS_onExit = () => { state.emulatorStarted = false; state.emulatorReady = false; stopEmulatorFrameMonitor(); if (isHost()) closeAllStreams(); $("emulatorStatus").textContent = "Emulator exited"; log("emulator_exit"); };
   if (state.emulatorScript) state.emulatorScript.remove();
   const script = document.createElement("script");
