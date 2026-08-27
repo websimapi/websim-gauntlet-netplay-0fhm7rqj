@@ -3,8 +3,8 @@
 const EMULATOR_CORE = "mupen64plus_next";
 const INPUT_HEARTBEAT_MS = 33;
 const ANALOG_MAX = 0x7fff;
-const STREAM_CAPTURE_FPS = 30;
-const STREAM_MAX_BITRATE = 1800000;
+const STREAM_CAPTURE_FPS = 60;
+const STREAM_MAX_BITRATE = 2200000;
 const STREAM_AUDIO_MAX_BITRATE = 128000;
 const STREAM_CONFIG = { iceServers: [{ urls: "stun:stun.l.google.com:19302" }], bundlePolicy: "max-bundle", rtcpMuxPolicy: "require" };
 
@@ -808,7 +808,33 @@ async function launchEmulator(reason = "manual") {
   // webgl2Enabled internal flag could force a mismatched renderer and cause
   // corrupted N64 frames on some browsers.
   window.EJS_forceLegacyCores = false;
-  window.EJS_defaultOptions = { ...(window.EJS_defaultOptions || {}), vsync: "enabled", shader: "disabled" };
+  window.EJS_defaultOptions = {
+    ...(window.EJS_defaultOptions || {}),
+    // Keep the core clock independent from a throttled browser compositor.
+    // The host is authoritative, so its emulation clock must stay real-time.
+    vsync: "disabled",
+    fastForward: "disabled",
+    slowMotion: "disabled",
+    shader: "disabled",
+    // Mupen64Plus-Next performance profile. The prefix and option values
+    // match the current libretro core (mupen64plus_next).
+    "mupen64plus_next-rdp-plugin": "gliden64",
+    "mupen64plus_next-cpucore": "dynamic_recompiler",
+    "mupen64plus_next-rsp-plugin": "hle",
+    "mupen64plus_next-43screensize": "640x480",
+    "mupen64plus_next-aspect": "4:3",
+    "mupen64plus_next-EnableNativeResFactor": "False",
+    "mupen64plus_next-ThreadedRenderer": "False",
+    "mupen64plus_next-MultiSampling": "0",
+    "mupen64plus_next-FXAA": "0",
+    "mupen64plus_next-EnableFBEmulation": "True",
+    "mupen64plus_next-EnableCopyColorToRDRAM": "Async",
+    "mupen64plus_next-EnableCopyDepthToRDRAM": "Off",
+    "mupen64plus_next-EnableHWLighting": "False",
+    "mupen64plus_next-EnableShadersStorage": "True",
+    "mupen64plus_next-EnableTextureCache": "True",
+    "mupen64plus_next-txHiresEnable": "False",
+  };
   window.EJS_startOnLoaded = true;
   window.EJS_DEBUG_XX = false;
   window.EJS_controlScheme = "n64";
