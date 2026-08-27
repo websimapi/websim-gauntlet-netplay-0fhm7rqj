@@ -1034,7 +1034,7 @@ async function boot() {
   refreshLobbies();
   try { state.user = await window.websim?.getUser?.(); log("identity_loaded", { signedIn: Boolean(state.user), username: state.user?.username || null }); }
   catch (error) { log("identity_error", { message: error.message }, "WARN"); }
-  log("client_ready", { browser: navigator.userAgent, protocol: "host-authority/1.0" });
+  log("client_ready", { browser: navigator.userAgent, protocol: "host-authority/1.0", crossOriginIsolated: Boolean(window.crossOriginIsolated), sharedArrayBuffer: typeof window.SharedArrayBuffer === "function", serviceWorkerControlled: Boolean(navigator.serviceWorker?.controller) });
 }
 
 boot();
